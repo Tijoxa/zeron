@@ -23,6 +23,8 @@ pub enum HarnessId {
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
+    /// DeepSeek Harness, driven through its native ACP profile (`dsh --profile acp`).
+    DeepseekHarness,
     /// Test harness; never shown in production pickers.
     Mock,
 }

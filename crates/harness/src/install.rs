@@ -53,6 +53,7 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
     let windows = platform == Platform::Windows;
     match id {
         Mock => vec![],
+        DeepseekHarness => vec![],
         Antigravity => vec![Archive],
         ClaudeCode if windows => vec![PowerShell("irm https://claude.ai/install.ps1 | iex")],
         ClaudeCode => vec![Shell(
@@ -158,6 +159,7 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Grok => "npm install -g @xai-official/grok",
         Hermes => "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
+        DeepseekHarness => return None,
         Antigravity | Mock => return None,
     })
 }
@@ -173,6 +175,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Grok => ("grok", "~/.grok/bin or the npm global bin"),
         Hermes => ("hermes", "~/.local/bin or ~/.hermes/bin"),
         Devin => ("devin", "~/.local/bin"),
+        DeepseekHarness => ("npx", "the Node.js installation"),
         Antigravity => ("agy_acp_server", "~/.zeron/adapters"),
         Mock => ("mock", "PATH"),
     }
@@ -189,6 +192,7 @@ pub fn installed(id: HarnessId) -> bool {
         Grok => crate::AcpHarness::grok().installed(),
         Hermes => crate::AcpHarness::hermes().installed(),
         Devin => crate::AcpHarness::devin().installed(),
+        DeepseekHarness => crate::AcpHarness::deepseek_harness().installed(),
         Antigravity => crate::AcpHarness::antigravity().installed(),
         Mock => false,
     }
@@ -391,7 +395,7 @@ async fn run(
 mod tests {
     use super::*;
 
-    const IDS: [HarnessId; 10] = [
+    const IDS: [HarnessId; 11] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -401,6 +405,7 @@ mod tests {
         HarnessId::Hermes,
         HarnessId::Devin,
         HarnessId::Antigravity,
+        HarnessId::DeepseekHarness,
         HarnessId::Mock,
     ];
 
@@ -409,7 +414,7 @@ mod tests {
         for platform in [Platform::Unix, Platform::Mac, Platform::Windows] {
             for id in IDS {
                 let list = methods(id, platform);
-                assert_eq!(list.is_empty(), id == HarnessId::Mock);
+                assert_eq!(list.is_empty(), matches!(id, HarnessId::Mock | HarnessId::DeepseekHarness));
                 for method in list {
                     assert!(available(method, platform, &|_| true, true));
                     assert!(!available(method, platform, &|_| false, false));

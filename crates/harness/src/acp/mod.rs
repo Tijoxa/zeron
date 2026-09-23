@@ -345,6 +345,35 @@ fn devin_spec() -> AcpAgentSpec {
     }
 }
 
+fn deepseek_harness_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::DeepseekHarness,
+        display_name: "DeepSeek Harness",
+        executable: "npx",
+        env_override: "DSH_NPX_EXECUTABLE",
+        args: &["--yes", "@deepseek-ai/dsh", "--profile", "acp"],
+        npm_package: None,
+        archive: None,
+        extra_paths: Vec::new,
+        cli_executable: "npx",
+        cli_extra_paths: Vec::new,
+        install_hint: "npx (install Node.js with npm/npx to run `npx @deepseek-ai/dsh --profile acp`; set DSH_NPX_EXECUTABLE to override)",
+        models: Vec::new,
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+        effort_in_model_id: false,
+        auth_method: None,
+        skill_dirs: Vec::new,
+        hidden_commands: &[],
+    }
+}
+
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = crate::executable::home_dir() {
@@ -904,6 +933,12 @@ impl AcpHarness {
         Self::with_spec(devin_spec())
     }
 
+    /// DeepSeek Harness's native ACP profile.
+    pub fn deepseek_harness() -> Self {
+        Self::with_spec(deepseek_harness_spec())
+            .with_model_discovery_timeout(Duration::from_secs(90))
+    }
+
     /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
     pub fn grok() -> Self {
         Self::with_spec(grok_spec())
@@ -1456,6 +1491,23 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
     }
 }
 
+/// Flatten ACP select choices, including provider-grouped rows used by DSH.
+fn config_choice_rows(option: &Value) -> Vec<&Value> {
+    option
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| {
+            entry
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|group| group.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![entry])
+        })
+        .collect()
+}
+
 /// Derive the model list a `session/new` response advertises. The `model`
 /// config option's choices come FIRST, the legacy first-class `models` state
 /// is only a fallback: the org adapters enumerate one `availableModels` entry
@@ -1535,8 +1587,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
     let model_select: Vec<&Value> = config_options
         .iter()
         .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
-        .and_then(|o| o.get("options").and_then(Value::as_array))
-        .map(|opts| opts.iter().collect())
+        .map(config_choice_rows)
         .unwrap_or_default();
     if !model_select.is_empty() {
         let raw_ids: Vec<&str> = model_select
@@ -2146,12 +2197,8 @@ fn validate_config_model_selection(
     else {
         return Ok(());
     };
-    let available: Vec<&str> = option
-        .get("options")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
+    let available: Vec<&str> = config_choice_rows(option)
+        .into_iter()
         .filter_map(|choice| choice.get("value").and_then(Value::as_str))
         .collect();
     let context_1m = model_options
@@ -2215,12 +2262,8 @@ fn config_option_sets(
         let kind = option.get("type").and_then(Value::as_str).unwrap_or("");
         let category = option.get("category").and_then(Value::as_str);
         let current = option.get("currentValue");
-        let available: Vec<&str> = option
-            .get("options")
-            .and_then(Value::as_array)
-            .map(|a| a.as_slice())
-            .unwrap_or_default()
-            .iter()
+        let available: Vec<&str> = config_choice_rows(option)
+            .into_iter()
             .filter_map(|o| o.get("value").and_then(Value::as_str))
             .collect();
 
@@ -2735,7 +2778,7 @@ async fn request_draining(
     method: &'static str,
     params: Value,
 ) -> Result<Value, HarnessError> {
-    let loading_session = matches!(method, "session/new" | "session/load");
+    let loading_session = matches!(method, "session/new" | "session/load" | "session/resume");
     let requested_session = params
         .get("sessionId")
         .and_then(Value::as_str)
@@ -2907,7 +2950,12 @@ async fn run_session(session: Session) {
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
-            match request_draining(&client, &mut incoming, "session/load", load).await {
+            let resume_method = if harness == HarnessId::DeepseekHarness {
+                "session/resume"
+            } else {
+                "session/load"
+            };
+            match request_draining(&client, &mut incoming, resume_method, load).await {
                 Ok(resp) => (resume.clone(), resp),
                 Err(e) if auth_method.is_some() && is_auth_required(&e) => {
                     return Err(HarnessError::Protocol(format!(
@@ -2918,7 +2966,7 @@ async fn run_session(session: Session) {
                 Err(e) => {
                     tracing::debug!(
                         target: "zeron_harness::acp",
-                        "session/load failed (starting fresh): {e}"
+                        "session restore failed (starting fresh): {e}"
                     );
                     let _ = send(&event_tx, AgentEvent::Error {
                         message: format!("{agent_name} could not restore session {resume}; starting a new session without the previous context: {e}"),
@@ -4588,6 +4636,72 @@ mod tests {
             vec!["fast-mode"]
         );
         assert_eq!(models[0].options[0].default_choice, "off");
+    }
+
+    #[test]
+    fn deepseek_uses_npx_without_global_dsh_install() {
+        let harness = AcpHarness::deepseek_harness();
+        assert_eq!(harness.id(), HarnessId::DeepseekHarness);
+        assert_eq!(harness.spec.executable, "npx");
+        assert_eq!(
+            harness.spec.args,
+            &["--yes", "@deepseek-ai/dsh", "--profile", "acp"]
+        );
+        assert_eq!(harness.spec.cli_executable, "npx");
+    }
+
+    #[test]
+    fn deepseek_grouped_models_are_selectable() {
+        let model_id = r#"["deepseek-official","deepseek-v4-pro"]"#;
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "other",
+                    "options": [{
+                        "group": "deepseek-official",
+                        "name": "DeepSeek",
+                        "options": [{ "value": model_id, "name": "DeepSeek V4 Pro" }]
+                    }]
+                },
+                {
+                    "id": "reasoning_effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "low",
+                    "options": [
+                        { "value": "low", "name": "Low" },
+                        { "value": "high", "name": "High" }
+                    ]
+                }
+            ]
+        });
+        let models = models_from_session(&response, &[]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, model_id);
+        assert_eq!(models[0].label, "DeepSeek V4 Pro");
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![ReasoningLevel::Low, ReasoningLevel::High]
+        );
+        assert!(
+            validate_config_model_selection(&response, Some(model_id), &serde_json::Map::new())
+                .is_ok()
+        );
+        let sets = config_option_sets(
+            &response,
+            Some(model_id),
+            &["high"],
+            &serde_json::Map::new(),
+        );
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0].0, "model");
+        assert_eq!(sets[0].1, json!({"value": model_id}));
+        assert_eq!(sets[1].0, "reasoning_effort");
+        assert_eq!(sets[1].1, json!({"value": "high"}));
     }
 
     #[test]

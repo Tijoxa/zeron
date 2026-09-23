@@ -212,6 +212,7 @@ icon_assets![
     (ZERON_LOGO, "zeron-logo"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
+    (DEEPSEEK_MARK, "deepseek-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
     (DEVIN_MARK, "devin-mark"),
@@ -245,6 +246,11 @@ impl AssetSource for Assets {
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {
     gpui::rgb(0xD97757).into()
+}
+
+/// The DeepSeek mark's neutral gray (`#9A9A9A`).
+pub fn deepseek_brand() -> Hsla {
+    gpui::rgb(0x9A9A9A).into()
 }
 
 /// An icon element for an embedded asset path. Size and colour are set by the

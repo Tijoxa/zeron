@@ -76,6 +76,10 @@ pub(crate) fn context(
             }
             files
         }
+        HarnessId::DeepseekHarness => {
+            let root = root("DSH_HOME", home.join(".dsh"));
+            vec![root.join("settings.yaml"), root.join(".credentials.yaml")]
+        }
         _ => vec![],
     };
     let binary = binary
@@ -104,6 +108,7 @@ pub(crate) fn context(
         HarnessId::Hermes => &["HERMES_", "OPENAI_", "ANTHROPIC_"],
         HarnessId::Pi => &["PI_", "OPENAI_", "ANTHROPIC_"],
         HarnessId::Devin => &["DEVIN_"],
+        HarnessId::DeepseekHarness => &["DSH_", "DEEPSEEK_"],
         HarnessId::Antigravity => &["GEMINI_", "GOOGLE_"],
         HarnessId::Cursor => &["CURSOR_"],
         _ => &[],

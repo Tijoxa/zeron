@@ -49,6 +49,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
         HarnessId::Antigravity => "Google's Antigravity agent (Antigravity ACP server).",
+        HarnessId::DeepseekHarness => "DeepSeek's coding agent, run through npx and its ACP server.",
         HarnessId::Mock => "Scripted test harness.",
     }
 }
@@ -105,6 +106,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "Antigravity",
+        HarnessId::DeepseekHarness => "npx",
         HarnessId::Mock => "mock",
     }
 }
@@ -1250,6 +1252,7 @@ mod tests {
 fn install_visibility_and_hint_follow_target_capabilities() {
     for id in [
         HarnessId::Antigravity,
+        HarnessId::DeepseekHarness,
         HarnessId::Codex,
         HarnessId::Opencode,
         HarnessId::ClaudeCode,
