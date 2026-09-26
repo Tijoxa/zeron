@@ -4,6 +4,8 @@
      bundling steps. Replace __VERSION__ before packaging. -->
 <plist version="1.0">
 <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Zeron uses the microphone to transcribe your voice in chat.</string>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>

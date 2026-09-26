@@ -75,11 +75,14 @@ uuid.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
 sha2.workspace = true
 roxmltree = "0.21.1"
 png = "0.18"
 thiserror.workspace = true
 rust-embed = "=8.7.2"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "recording", "mp3"] }
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
@@ -91,7 +94,6 @@ block2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSBitmapImageRep", "NSImage", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
 objc2-foundation = "0.3.2"
 objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKNavigationDelegate", "WKNavigationAction", "WKSnapshotConfiguration"] }
-reqwest.workspace = true
 core-foundation = "0.10"
 core-graphics = { version = "0.24", features = ["elcapitan", "highsierra", "link"] }
 foreign-types = "0.5"

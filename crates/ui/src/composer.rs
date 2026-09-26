@@ -7,10 +7,14 @@
 //! pending-input detection) lives in free functions/structs with unit tests;
 //! the gpui element only feeds them measurements.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -34,6 +38,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::composer_markdown::{self, in_code};
+use crate::icons;
 use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
@@ -1732,6 +1737,8 @@ pub struct ComposerInput {
     accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
+    /// Secret fields use a separate display projection without exposing their value.
+    masked: bool,
     edit_revision: u64,
     pub(crate) read_only: bool,
     placeholder: SharedString,
@@ -1826,6 +1833,14 @@ impl ComposerInput {
         Self::with_context(placeholder, GENERIC_COMPOSER_CONTEXT, cx)
     }
 
+    pub fn with_masked(mut self) -> Self {
+        self.masked = true;
+        self.single_line = true;
+        self.mentions_enabled = false;
+        self.refresh_projection();
+        self
+    }
+
     /// An input in a custom KEY context — palettes use `"PaletteSearch"`,
     /// whose keymap binds only text-editing keys so navigation keys bubble to
     /// the surrounding frame (see `init`).
@@ -1839,6 +1854,7 @@ impl ComposerInput {
             accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
+            masked: false,
             edit_revision: 0,
             read_only: false,
             placeholder: placeholder.into(),
@@ -1993,7 +2009,18 @@ impl ComposerInput {
     }
 
     fn refresh_projection(&mut self) {
-        self.projection = if self.mentions_enabled {
+        self.projection = if self.masked {
+            TextProjection {
+                display: "*".repeat(self.content.chars().count()),
+                mentions: Vec::new(),
+                mappings: self
+                    .content
+                    .char_indices()
+                    .enumerate()
+                    .map(|(i, (raw, ch))| (raw..raw + ch.len_utf8(), i..i + 1))
+                    .collect(),
+            }
+        } else if self.mentions_enabled {
             TextProjection::rich(&self.content, Some(self.editing_source_range()))
         } else {
             TextProjection {
@@ -2786,6 +2813,9 @@ impl ComposerInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.masked {
+            return;
+        }
         if let Some((raw, text)) = self.clipboard_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
                 text.clone(),
@@ -2799,7 +2829,7 @@ impl ComposerInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
+        if self.read_only || self.masked {
             return;
         }
         if let Some((raw, text)) = self.clipboard_selection() {
@@ -3887,7 +3917,12 @@ impl EntityInputHandler for ComposerInput {
             .projection
             .normalize_range(self.range_from_utf16(&range_utf16));
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content.get(range)?.to_string())
+        let text = self.content.get(range)?;
+        Some(if self.masked {
+            "*".repeat(text.encode_utf16().count())
+        } else {
+            text.to_string()
+        })
     }
 
     fn selected_text_range(
@@ -5234,7 +5269,26 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoicePhase {
+    Idle,
+    Listening,
+    Transcribing,
+    Synthesizing,
+    Speaking,
+}
+
 pub struct Composer {
+    voice_phase: VoicePhase,
+    voice_recording: Option<crate::voice::Recording>,
+    voice_send_pending: bool,
+    voice_stop: Arc<AtomicBool>,
+    voice_task: Option<Task<()>>,
+    voice_tick: Option<Task<()>>,
+    voice_level: Arc<AtomicU32>,
+    voice_levels: VecDeque<u32>,
+    voice_chat: Option<String>,
+    voice_error: Option<String>,
     pub(crate) state: Entity<AppState>,
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
@@ -5442,8 +5496,11 @@ impl Composer {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        cx.on_release(|this, cx| this.release_queue_previews(cx))
-            .detach();
+        cx.on_release(|this, cx| {
+            this.cancel_voice();
+            this.release_queue_previews(cx);
+        })
+        .detach();
         let input = cx.new(|cx| {
             let mut input =
                 ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
@@ -5515,6 +5572,16 @@ impl Composer {
         .detach();
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
+            voice_phase: VoicePhase::Idle,
+            voice_recording: None,
+            voice_send_pending: false,
+            voice_stop: Arc::new(AtomicBool::new(false)),
+            voice_task: None,
+            voice_tick: None,
+            voice_level: Arc::new(AtomicU32::new(0)),
+            voice_levels: VecDeque::from(vec![0; 40]),
+            voice_chat: None,
+            voice_error: None,
             state,
             input,
             queue_edit_draft: None,
@@ -6771,8 +6838,48 @@ impl Composer {
         ))
     }
 
-    fn render_input_with_completion(&self) -> gpui::Div {
-        div().relative().child(self.input.clone())
+    fn render_input_with_completion(&self, cx: &App) -> gpui::AnyElement {
+        if matches!(
+            self.voice_phase,
+            VoicePhase::Listening | VoicePhase::Transcribing
+        ) {
+            let theme = Theme::of(cx);
+            return div()
+                .id("composer-dictation")
+                .w_full()
+                .h(px(INPUT_LINE_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .overflow_hidden()
+                .when(self.voice_phase == VoicePhase::Listening, |row| {
+                    row.children(self.voice_levels.iter().map(|level| {
+                        div()
+                            .flex_1()
+                            .min_w(px(2.0))
+                            .h(px(3.0 + *level as f32 * 0.19))
+                            .rounded_full()
+                            .bg(theme.text_muted)
+                    }))
+                })
+                .when(self.voice_phase == VoicePhase::Transcribing, |row| {
+                    row.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(if self.voice_send_pending {
+                                "Transcribing and sending…"
+                            } else {
+                                "Transcribing…"
+                            }),
+                    )
+                })
+                .into_any_element();
+        }
+        div()
+            .relative()
+            .child(self.input.clone())
+            .into_any_element()
     }
 
     // ---- slash commands ---------------------------------------------------
@@ -7203,6 +7310,18 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        if self.voice_phase != VoicePhase::Idle
+            && self.voice_chat.as_deref().is_some_and(|id| {
+                self.state
+                    .read(cx)
+                    .selected_chat
+                    .as_deref()
+                    .unwrap_or_default()
+                    != id
+            })
+        {
+            self.stop_voice(cx);
+        }
         {
             let state = self.state.read(cx);
             let now = chrono::Utc::now();
@@ -7457,6 +7576,16 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.voice_phase,
+            VoicePhase::Listening | VoicePhase::Transcribing
+        ) {
+            self.finish_voice(true, cx);
+            return;
+        }
+        if self.voice_phase != VoicePhase::Idle {
+            self.stop_voice(cx);
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -7500,10 +7629,248 @@ impl Composer {
         }
     }
 
+    fn start_voice(&mut self, cx: &mut Context<Self>) {
+        if self.voice_phase != VoicePhase::Idle {
+            return;
+        }
+        if self.editing_queued.is_some() || self.wizard.is_some() {
+            self.voice_error = Some("Finish the current chat action before starting voice".into());
+            cx.notify();
+            return;
+        }
+        let voice_settings = crate::settings::current(cx).voice;
+        if !crate::voice::has_api_key(&voice_settings) {
+            self.voice_error = Some("Set an OpenRouter API key in Voice settings".into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = crate::voice::validate_dictation_settings(&voice_settings) {
+            self.voice_error = Some(error);
+            cx.notify();
+            return;
+        }
+        match crate::voice::Recording::start() {
+            Ok(recording) => {
+                self.voice_level = recording.level.clone();
+                self.voice_recording = Some(recording);
+                self.voice_send_pending = false;
+                self.voice_phase = VoicePhase::Listening;
+                self.voice_error = None;
+                self.voice_stop.store(true, Ordering::Release);
+                self.voice_stop = Arc::new(AtomicBool::new(false));
+                self.voice_chat = Some(
+                    self.state
+                        .read(cx)
+                        .selected_chat
+                        .clone()
+                        .unwrap_or_default(),
+                );
+                self.voice_levels = VecDeque::from(vec![0; 40]);
+                self.voice_tick = Some(cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(90))
+                            .await;
+                        let active = this
+                            .update(cx, |composer, cx| {
+                                composer.voice_levels.pop_front();
+                                let level = if matches!(
+                                    composer.voice_phase,
+                                    VoicePhase::Listening | VoicePhase::Speaking
+                                ) {
+                                    composer.voice_level.load(Ordering::Relaxed)
+                                } else {
+                                    0
+                                };
+                                composer.voice_levels.push_back(level);
+                                if composer
+                                    .voice_recording
+                                    .as_ref()
+                                    .is_some_and(|r| r.is_finished())
+                                {
+                                    composer.finish_voice(false, cx);
+                                }
+                                cx.notify();
+                                composer.voice_phase != VoicePhase::Idle
+                            })
+                            .unwrap_or(false);
+                        if !active {
+                            break;
+                        }
+                    }
+                }));
+            }
+            Err(error) => self.voice_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn finish_voice(&mut self, send: bool, cx: &mut Context<Self>) {
+        self.voice_send_pending |= send;
+        if self.voice_phase == VoicePhase::Transcribing {
+            cx.notify();
+            return;
+        }
+        let Some(recording) = self.voice_recording.take() else {
+            return;
+        };
+        self.voice_phase = VoicePhase::Transcribing;
+        let config = crate::settings::current(cx).voice;
+        let stop = self.voice_stop.clone();
+        let request = gpui_tokio::Tokio::spawn(cx, async move {
+            match recording.finish().await {
+                Ok(wav) => crate::voice::transcribe(&config, wav).await,
+                Err(error) => Err(error),
+            }
+        });
+        self.voice_task = Some(cx.spawn(async move |this, cx| {
+            let result = request.await.unwrap_or_else(|error| Err(error.to_string()));
+            this.update(cx, |composer, cx| {
+                if !stop.load(Ordering::Acquire) {
+                    composer.complete_dictation(result, cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn complete_dictation(&mut self, result: Result<String, String>, cx: &mut Context<Self>) {
+        let send = std::mem::take(&mut self.voice_send_pending);
+        self.voice_phase = VoicePhase::Idle;
+        self.voice_chat = None;
+        self.voice_tick = None;
+        match result {
+            Ok(text) => {
+                let draft = self.input.read(cx).text().to_string();
+                let text = if draft.trim().is_empty() {
+                    text
+                } else {
+                    format!("{draft}\n\n{text}")
+                };
+                self.input.update(cx, |input, cx| input.set_text(text, cx));
+                self.focus_pending = true;
+                if send && self.wizard.is_none() && self.editing_queued.is_none() {
+                    self.on_submit(cx);
+                }
+            }
+            Err(error) => self.voice_error = Some(error),
+        }
+        cx.notify();
+    }
+    fn cancel_voice(&mut self) {
+        self.voice_stop.store(true, Ordering::Release);
+        if let Some(recording) = self.voice_recording.take() {
+            recording.cancel();
+        }
+        self.voice_task = None;
+        self.voice_tick = None;
+        self.voice_phase = VoicePhase::Idle;
+        self.voice_send_pending = false;
+        self.voice_chat = None;
+    }
+
+    pub(crate) fn stop_voice(&mut self, cx: &mut Context<Self>) {
+        self.cancel_voice();
+        self.voice_error = None;
+        cx.notify();
+    }
+
+    fn on_voice_button(&mut self, cx: &mut Context<Self>) {
+        match self.voice_phase {
+            VoicePhase::Idle => self.start_voice(cx),
+            VoicePhase::Listening => self.finish_voice(false, cx),
+            _ => self.stop_voice(cx),
+        }
+    }
+
+    pub(crate) fn read_aloud(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.stop_voice(cx);
+        let config = crate::settings::current(cx).voice;
+        if config.speech_model.trim().is_empty() {
+            self.voice_error = Some("Choose a speech model in Voice settings to read aloud".into());
+            cx.notify();
+            return;
+        }
+        self.voice_stop = Arc::new(AtomicBool::new(false));
+        self.voice_chat = Some(
+            self.state
+                .read(cx)
+                .selected_chat
+                .clone()
+                .unwrap_or_default(),
+        );
+        let text = crate::voice::speech_text(text);
+        let chunks = crate::voice::speech_chunks(&text);
+        self.voice_phase = VoicePhase::Synthesizing;
+        let config = crate::settings::current(cx).voice;
+        let stop = self.voice_stop.clone();
+        self.voice_level = Arc::new(AtomicU32::new(0));
+        let level = self.voice_level.clone();
+        self.voice_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                for chunk in chunks {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let chunk_config = config.clone();
+                    let request = gpui_tokio::Tokio::spawn(cx, async move {
+                        crate::voice::synthesize(&chunk_config, &chunk).await
+                    });
+                    let audio = request.await.map_err(|e| e.to_string())??;
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    this.update(cx, |composer, cx| {
+                        composer.voice_phase = VoicePhase::Speaking;
+                        cx.notify();
+                    })
+                    .map_err(|e| e.to_string())?;
+                    let playback_stop = stop.clone();
+                    let playback_level = level.clone();
+                    let playback = gpui_tokio::Tokio::spawn(cx, async move {
+                        tokio::task::spawn_blocking(move || {
+                            crate::voice::play(audio, playback_stop, playback_level)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    });
+                    playback.await.map_err(|e| e.to_string())??;
+                    this.update(cx, |composer, cx| {
+                        composer.voice_phase = VoicePhase::Synthesizing;
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Ok(())
+            }
+            .await;
+            if !stop.load(Ordering::Acquire) {
+                this.update(cx, |composer, cx| {
+                    composer.voice_phase = VoicePhase::Idle;
+                    match result {
+                        Ok(()) => composer.voice_chat = None,
+                        Err(error) => composer.voice_error = Some(error),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+        cx.notify();
+    }
+
     /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.voice_phase,
+            VoicePhase::Listening | VoicePhase::Transcribing
+        ) {
+            self.finish_voice(true, cx);
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -8693,6 +9060,15 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
+        let dictating = matches!(
+            self.voice_phase,
+            VoicePhase::Listening | VoicePhase::Transcribing
+        );
+        let mode = if dictating {
+            SendButtonMode::Send
+        } else {
+            mode
+        };
         // Zeron composer-actions.tsx: a size-7 filled circle — up-arrow to
         // send/queue, a dark rounded square on the same light circle to stop.
         match mode {
@@ -8713,7 +9089,7 @@ impl Composer {
             SendButtonMode::Send | SendButtonMode::Queue => {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
-                let blocked = self.send_blocked(cx);
+                let blocked = !dictating && self.send_blocked(cx);
                 div()
                     .id("composer-send")
                     .size(px(28.0))
@@ -8737,6 +9113,92 @@ impl Composer {
                     .into_any_element()
             }
         }
+    }
+
+    fn render_voice_button(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::of(cx);
+        let active = self.voice_phase != VoicePhase::Idle;
+        div()
+            .id("composer-voice")
+            .size(px(28.0))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .aria_label(if self.voice_phase == VoicePhase::Listening {
+                "Stop dictation and insert text"
+            } else if active {
+                "Cancel transcription or stop playback"
+            } else {
+                "Dictate a message"
+            })
+            .bg(if active {
+                theme.text
+            } else {
+                motion::hover_blend(
+                    "composer-voice",
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.10),
+                )
+            })
+            .on_hover(motion::hover_listener("composer-voice"))
+            .text_color(if active { theme.bg } else { theme.text_muted })
+            .on_click(cx.listener(|this, _, _, cx| this.on_voice_button(cx)))
+            .child(
+                icons::icon(if active {
+                    icons::STOP
+                } else {
+                    icons::MICROPHONE
+                })
+                .size(px(16.0))
+                .text_color(if active { theme.bg } else { theme.text_muted }),
+            )
+            .into_any_element()
+    }
+
+    fn render_voice_panel(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let label = if let Some(error) = &self.voice_error {
+            error.clone()
+        } else {
+            match self.voice_phase {
+                VoicePhase::Synthesizing => "Preparing read aloud…".into(),
+                VoicePhase::Speaking => "Reading aloud…".into(),
+                _ => return None,
+            }
+        };
+        Some(
+            div()
+                .id("voice-status")
+                .px(px(12.0))
+                .py(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().flex_1().min_w_0().text_size(px(12.0)).child(label))
+                .child(
+                    div()
+                        .id("voice-close")
+                        .size(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .aria_label("Dismiss or stop reading")
+                        .child(
+                            icons::icon(icons::CLOSE)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_voice(cx))),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -9219,6 +9681,7 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let voice_button = self.render_voice_button(cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -9333,6 +9796,8 @@ impl Render for Composer {
                 .map_or(0.0, |bounds| f32::from(bounds.size.width))
             - ACTION_PRIMARY_GAP
             - 28.0
+            - ACTION_PRIMARY_GAP
+            - 28.0
             - action_inset)
             .max(0.0);
         let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
@@ -9378,7 +9843,7 @@ impl Render for Composer {
                         .px(px(16.0))
                         .pt(px(text_pt))
                         .pb(px(4.0))
-                        .child(self.render_input_with_completion()),
+                        .child(self.render_input_with_completion(cx)),
                 )
                 .child(
                     div()
@@ -9408,6 +9873,7 @@ impl Render for Composer {
                                 .child(attach)
                                 .child(model_picker),
                         )
+                        .child(voice_button)
                         .child(send_button),
                 )
         } else {
@@ -9455,7 +9921,7 @@ impl Render for Composer {
                                 .px(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
-                                .child(self.render_input_with_completion()),
+                                .child(self.render_input_with_completion(cx)),
                         )
                         .child(
                             div()
@@ -9468,10 +9934,14 @@ impl Render for Composer {
                         .child(
                             div()
                                 .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(ACTION_PRIMARY_GAP))
                                 .pl(px(ACTION_PRIMARY_GAP))
                                 .pr(px(action_inset))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .child(voice_button)
                                 .child(send_button),
                         ),
                 )
@@ -9554,7 +10024,9 @@ impl Render for Composer {
         } else {
             container
         };
-        let container = container.child(pill_surface);
+        let container = container
+            .children(self.render_voice_panel(&theme, cx))
+            .child(pill_surface);
 
         // The lower slot keeps a stable footprint for Git projects while its
         // old floating checkout/ref controls dissolve into the session footer.
@@ -9689,6 +10161,149 @@ mod tests {
     }
 
     #[gpui::test]
+    fn voice_key_input_masks_native_text_and_clipboard(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, window, cx| {
+            input.masked = true;
+            input.set_text("secret-é", cx);
+            assert_eq!(input.projection.display, "********");
+            let mut actual = None;
+            assert_eq!(
+                input.text_for_range(0..8, &mut actual, window, cx).unwrap(),
+                "********"
+            );
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            input.selected_range = 0..input.content.len();
+            input.copy(&Copy, window, cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "unchanged"
+            );
+            input.cut(&Cut, window, cx);
+            assert_eq!(input.text(), "secret-é");
+        });
+    }
+
+    #[gpui::test]
+    fn voice_stop_inserts_a_draft_without_sending_or_reading(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                assert!(crate::settings::current(cx).voice.speech_model.is_empty());
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Existing draft", cx));
+                composer.voice_phase = VoicePhase::Transcribing;
+                composer.voice_send_pending = false;
+                composer.complete_dictation(Ok("Texte dicté".into()), cx);
+                assert_eq!(
+                    composer.input.read(cx).text(),
+                    "Existing draft\n\nTexte dicté"
+                );
+                assert!(composer.failure.is_none(), "Stop must not invoke send");
+                assert!(composer.voice_error.is_none());
+                assert_eq!(composer.voice_phase, VoicePhase::Idle);
+                assert!(composer.voice_chat.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn voice_send_waits_for_transcription_then_uses_normal_submission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.voice_phase = VoicePhase::Transcribing;
+                composer.on_submit(cx);
+                composer.on_submit(cx);
+                assert!(composer.voice_send_pending);
+                assert_eq!(composer.voice_phase, VoicePhase::Transcribing);
+                assert!(composer.failure.is_none(), "Must wait for the transcript");
+                composer.complete_dictation(Ok("Bonjour".into()), cx);
+                // No engine in this fixture: normal send is attempted and keeps
+                // the draft, rather than losing the recognized text on failure.
+                assert_eq!(composer.failure.as_deref(), Some("Engine not connected"));
+                assert_eq!(composer.input.read(cx).text(), "Bonjour");
+                assert!(!composer.voice_send_pending);
+                assert_eq!(composer.voice_phase, VoicePhase::Idle);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn voice_transcription_error_preserves_draft_and_clears_send_intent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Keep me", cx));
+                composer.voice_phase = VoicePhase::Transcribing;
+                composer.voice_send_pending = true;
+                composer.complete_dictation(Err("Provider unavailable".into()), cx);
+                assert_eq!(composer.input.read(cx).text(), "Keep me");
+                assert!(composer.failure.is_none());
+                assert!(!composer.voice_send_pending);
+                assert_eq!(composer.voice_phase, VoicePhase::Idle);
+                assert_eq!(
+                    composer.voice_error.as_deref(),
+                    Some("Provider unavailable")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn voice_waveform_renders_inside_composer_without_a_status_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        for phase in [VoicePhase::Listening, VoicePhase::Transcribing] {
+            handle
+                .update(cx, |composer, _, cx| {
+                    composer.voice_phase = phase;
+                    composer.voice_levels = VecDeque::from(vec![30; 40]);
+                    assert!(
+                        composer
+                            .render_voice_panel(&Theme::of(cx).clone(), cx)
+                            .is_none()
+                    );
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn voice_cancellation_signals_workers_and_clears_session(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.voice_phase = VoicePhase::Speaking;
+                composer.voice_chat = Some("chat".into());
+
+                composer.voice_stop = Arc::new(AtomicBool::new(false));
+                let stop = composer.voice_stop.clone();
+                composer.stop_voice(cx);
+                assert!(stop.load(Ordering::Acquire));
+                assert!(composer.voice_chat.is_none());
+
+                assert!(composer.voice_phase == VoicePhase::Idle);
+                assert!(composer.voice_task.is_none());
+                assert!(composer.voice_tick.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -9696,7 +10311,9 @@ mod tests {
         let input = handle
             .read_with(cx, |composer, _| composer.input.clone())
             .unwrap();
-        for thread_width in [436.0, 592.0, 768.0, 1232.0] {
+        // The compact boundary now includes the microphone and its gap.
+        // Narrower panels intentionally expand to preserve the editor width.
+        for thread_width in [436.0 + 28.0 + ACTION_PRIMARY_GAP, 592.0, 768.0, 1232.0] {
             for docked in [true, false] {
                 let amounts = if docked {
                     [0.0, 0.2, 0.6, 0.98, 1.0]
@@ -9743,19 +10360,55 @@ mod tests {
                     let inset = motion::lerp(12.0, 8.0, amount);
                     let left = surface.left() + px(1.0 + inset + 28.0 + ACTION_UTILITY_GAP);
                     let travel = surface.size.width - px(2.0 + inset + 28.0 + ACTION_UTILITY_GAP
-                        + ACTION_PRIMARY_GAP + 28.0 + inset) - model.size.width;
+                        + ACTION_PRIMARY_GAP + 28.0 + ACTION_PRIMARY_GAP + 28.0 + inset) - model.size.width;
                     let (side, _, drift) = model_handoff(amount);
                     let expected_x = left + travel * side + px(drift);
                     assert!((f32::from(model.left() - expected_x)).abs() <= 1.0,
                         "model jumped: docked={docked}, amount={amount}, actual={model:?}, expected={expected_x:?}");
                     let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
                     assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
-                    assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
+                    assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1,
+                        "height mismatch: width={thread_width}, docked={docked}, amount={amount}, rendered={}, content={}, expanded={}", composer.last_rendered_height, input.read(cx).measured_content_height(), composer.expanded_mode);
                         }).unwrap();
                     });
                 }
             }
         }
+    }
+
+    #[gpui::test]
+    fn voice_button_keeps_narrow_chat_editor_usable(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, window, cx| {
+                window.resize(size(px(436.0), px(800.0)));
+                composer.set_available_width(436.0, cx);
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Hi", cx));
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+            })
+            .unwrap();
+        for _ in 0..6 {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+        }
+        handle
+            .read_with(cx, |composer, cx| {
+                assert!(
+                    composer.expanded_mode,
+                    "narrow chat should make room for both actions"
+                );
+                assert!(composer.input.read(cx).last_width >= MIN_COMPACT_INPUT_WIDTH);
+            })
+            .unwrap();
     }
 
     #[test]

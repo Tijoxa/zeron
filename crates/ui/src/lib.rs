@@ -59,6 +59,7 @@ pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
+pub mod voice;
 mod workspace_links;
 
 use std::path::PathBuf;

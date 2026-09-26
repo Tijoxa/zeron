@@ -3244,6 +3244,9 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    ReadAloud {
+        text: String,
+    },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -6528,6 +6531,7 @@ impl Transcript {
             .is_some_and(|(_, entry)| entry == &row.entry_id);
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
+        let speech_text = (!is_user_row).then(|| copy_text.clone()).flatten();
         let copy_entry_id = row.entry_id.clone();
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
@@ -6571,7 +6575,29 @@ impl Transcript {
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy);
+            let speech = speech_text.map(|text| {
+                div()
+                    .id(SharedString::from(format!("read-aloud-{}", row.entry_id)))
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .cursor_pointer()
+                    .aria_label("Read aloud")
+                    .hover(|style| style.bg(crate::theme::ink(0.08)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(TranscriptEvent::ReadAloud {
+                            text: text.to_string(),
+                        });
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::VOLUME_LOUD)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+            });
+            let metadata = metadata.child(timestamp).children(copy).children(speech);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))

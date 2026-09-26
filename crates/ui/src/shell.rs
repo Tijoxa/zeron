@@ -43,6 +43,7 @@ use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::voice::VoicePage;
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -433,19 +434,21 @@ pub enum SettingsSection {
     Appearance,
     Files,
     Notifications,
+    Voice,
     Shortcuts,
     Appshots,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
+        SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
         SettingsSection::Archived,
@@ -461,6 +464,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
+            SettingsSection::Voice => "Voice",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
@@ -1552,6 +1556,7 @@ pub struct Shell {
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
+    voice_page: Option<Entity<VoicePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
@@ -1863,6 +1868,7 @@ impl Shell {
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
+            Some("settings/voice") => Route::Settings(SettingsSection::Voice),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -1956,6 +1962,7 @@ impl Shell {
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
+            voice_page: None,
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
@@ -3196,6 +3203,10 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::ReadAloud { text } => {
+                self.composer
+                    .update(cx, |composer, cx| composer.read_aloud(text, cx));
+            }
         }
     }
 
@@ -3737,6 +3748,7 @@ impl Shell {
         self.settings.code_font_size = current.code_font_size;
         self.settings.transcript_width = current.transcript_width;
         self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
+        self.settings.voice = current.voice;
         self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
     }
 
@@ -3822,6 +3834,11 @@ impl Shell {
     }
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.stop_voice(cx));
+        if section == SettingsSection::Voice {
+            self.voice_page = None;
+        }
         self.command_palette = None;
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
@@ -3876,6 +3893,8 @@ impl Shell {
                 }
             }
             NavEntry::Settings(section) => {
+                self.composer
+                    .update(cx, |composer, cx| composer.stop_voice(cx));
                 if section == SettingsSection::Shortcuts
                     && let Some(page) = &self.shortcuts_page
                 {
@@ -4040,6 +4059,12 @@ impl Shell {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
+            }
+            SettingsSection::Voice => {
+                if self.voice_page.is_none() {
+                    self.voice_page = Some(cx.new(VoicePage::new));
+                }
+                self.voice_page.as_ref().unwrap().clone().into_any_element()
             }
             SettingsSection::Shortcuts | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
@@ -5761,6 +5786,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Voice => icons::VOLUME_LOUD,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,

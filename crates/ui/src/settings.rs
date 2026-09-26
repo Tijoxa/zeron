@@ -25,6 +25,7 @@ pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod voice;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -244,6 +245,29 @@ pub fn set_transcript_width(width: f32, cx: &mut App) {
 pub enum SavePolicy {
     Debounced,
     Immediate,
+}
+
+/// Voice service is a viewer-side preference, independent of the chat harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VoiceSettings {
+    pub provider: String,
+    pub endpoint: String,
+    pub transcription_model: String,
+    pub speech_model: String,
+    pub voice: String,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            provider: "openrouter".into(),
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            transcription_model: "openai/whisper-1".into(),
+            speech_model: String::new(),
+            voice: String::new(),
+        }
+    }
 }
 
 /// The sole in-process owner and writer of `ui-settings.json`.
@@ -658,6 +682,8 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    /// Viewer-side voice provider and models; credentials live in the OS store.
+    pub voice: VoiceSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -817,6 +843,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            voice: VoiceSettings::default(),
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -2143,6 +2170,7 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            voice: VoiceSettings::default(),
             window_geometry: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
@@ -2264,6 +2292,26 @@ mod tests {
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
         assert!(json.contains(r#""codeFontSize": 11.0"#));
+    }
+
+    #[test]
+    fn voice_settings_migrate_and_persist_independently() {
+        let old: UiSettings = serde_json::from_str(r#"{"sidebarWidth":280}"#).unwrap();
+        assert_eq!(old.voice, VoiceSettings::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = old;
+        settings.voice = VoiceSettings {
+            provider: "openrouter".into(),
+            endpoint: "https://example.com/api/v1".into(),
+            transcription_model: "test/stt".into(),
+            speech_model: "test/tts".into(),
+            voice: "alloy".into(),
+        };
+        settings.save(dir.path()).unwrap();
+        assert_eq!(UiSettings::load(dir.path()).voice, settings.voice);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert!(json["voice"].get("apiKey").is_none());
+        assert!(json["voice"].get("harness").is_none());
     }
 
     #[test]
