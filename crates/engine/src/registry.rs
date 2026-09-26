@@ -2,7 +2,7 @@
 //! slots resolved on first use (claude-code spawns subprocess discovery; codex/cursor
 //! later). Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
 //!
-//! Also owns the device's harness ENABLEMENT (Settings → Agents): which harnesses
+//! Also owns the device's harness ENABLEMENT (Settings → Providers): which harnesses
 //! this device's composer offers, persisted in `{data_dir}/harness-prefs.json`.
 //! Per-device because CLI installs are — a viewer retargets the settings page at
 //! another device and edits THAT device's set over the forwarded RPCs.
@@ -33,7 +33,7 @@ pub struct HarnessDescriptor {
     /// Explicit CLI installation is available on this listing device.
     #[serde(default)]
     pub can_install: bool,
-    /// Whether the listing device offers this harness (Settings → Agents).
+    /// Whether the listing device offers this harness (Settings → Providers).
     /// `None` — the catalog came from an engine predating the setting — means
     /// "unknown": consumers fall back to detection (see [`descriptor_enabled`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,13 +471,13 @@ pub fn default_registry() -> HarnessRegistry {
     );
     // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
     // subagent transcripts), same lazy pattern: the static descriptor mirrors
-    // CursorHarness exactly. Turn-boundary steering; no effort ladder.
+    // CursorHarness exactly. Native step-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Cursor,
             name: "Cursor".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
             can_install: false,
@@ -705,6 +705,7 @@ mod tests {
                 HarnessId::Codex,
                 HarnessId::Cursor,
                 HarnessId::Devin,
+                HarnessId::DeepseekHarness,
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
@@ -723,7 +724,7 @@ mod tests {
         let grok = registry.resolve(HarnessId::Grok).unwrap();
         assert_eq!(grok.id(), HarnessId::Grok);
         assert_eq!(grok.display_name(), "Grok");
-        assert_eq!(grok.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(grok.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             grok.reasoning_levels(),
             &[
@@ -736,12 +737,12 @@ mod tests {
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
-        assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(cursor.steering_mode(), SteeringMode::StepBoundary);
         assert!(cursor.reasoning_levels().is_empty());
         let devin = registry.resolve(HarnessId::Devin).unwrap();
         assert_eq!(devin.id(), HarnessId::Devin);
         assert_eq!(devin.display_name(), "Devin");
-        assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
         assert!(devin.reasoning_levels().is_empty());
         let hermes = registry.resolve(HarnessId::Hermes).unwrap();
         assert_eq!(hermes.id(), HarnessId::Hermes);
@@ -751,7 +752,7 @@ mod tests {
         let opencode = registry.resolve(HarnessId::Opencode).unwrap();
         assert_eq!(opencode.id(), HarnessId::Opencode);
         assert_eq!(opencode.display_name(), "OpenCode");
-        assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(opencode.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             opencode.reasoning_levels(),
             &[
@@ -770,7 +771,7 @@ mod tests {
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
-        assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             pi.reasoning_levels(),
             &[

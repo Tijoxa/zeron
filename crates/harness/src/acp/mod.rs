@@ -31,6 +31,7 @@
 mod antigravity_paths;
 mod devin_models;
 mod normalize;
+mod pi_mcp;
 mod subagent;
 mod subagent_devin;
 mod system_message;
@@ -141,6 +142,9 @@ struct AcpAgentSpec {
     skill_dirs: fn() -> Vec<PathBuf>,
     /// advertised commands the picker leaves out.
     hidden_commands: &'static [&'static str],
+    /// A prompt cancelled before it produced anything vanishes from the
+    /// agent's history (Grok, verified live); preemption re-sends its text.
+    drops_unstarted_cancelled_prompt: bool,
 }
 
 fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
@@ -170,6 +174,18 @@ fn default_effort_values(
         ReasoningLevel::Ultra | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => {
             vec!["ultra", "max", "high"]
         }
+    }
+}
+
+/// Devin's `thought_level` also offers `none` ("No Thinking"), which the
+/// catalog maps to Zeron's lowest level.
+fn devin_effort_values(
+    reasoning: Option<ReasoningLevel>,
+    model: Option<&str>,
+) -> Vec<&'static str> {
+    match reasoning {
+        Some(ReasoningLevel::Minimal) => vec!["none", "minimal", "low"],
+        _ => default_effort_values(reasoning, model),
     }
 }
 
@@ -243,8 +259,9 @@ fn grok_spec() -> AcpAgentSpec {
                 options: Vec::new(),
             }]
         },
-        // No `_session/steering` extension: steers deliver at turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
+        // No `_session/steering` extension: a steer preempts the generation
+        // (waiting out running tools) and continues the turn — immediate.
+        steering_mode: SteeringMode::StepBoundary,
         // Grok Build's advertised efforts (default high); applied through the
         // session's `thought_level` config option.
         reasoning_levels: &[
@@ -266,6 +283,7 @@ fn grok_spec() -> AcpAgentSpec {
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: true,
     }
 }
 
@@ -299,10 +317,8 @@ fn devin_spec() -> AcpAgentSpec {
              `curl -fsSL https://cli.devin.ai/install.sh | bash` or \
              `brew install --cask devin-cli`, then `devin auth login`; set \
              DEVIN_EXECUTABLE to override)",
-        // Legacy metadata only: discovery uses `devin models list` because
-        // session/new starts with a stale catalog. Effort is baked into ids.
-        // These ids were live-verified with CLI 3000.6.14; `swe-1-7-medium`
-        // is the session default the server reports.
+        // Fallback metadata only: discovery uses `devin models list`, grouped
+        // into one model per family with effort levels (see `devin_models`).
         models: || {
             vec![
                 Model {
@@ -328,12 +344,14 @@ fn devin_spec() -> AcpAgentSpec {
                 },
             ]
         },
-        steering_mode: SteeringMode::TurnBoundary,
-        // Effort is encoded in Devin's advertised model ids, not a separate
-        // thought_level config option.
+        // No `_session/steering` extension: a steer preempts the generation
+        // (waiting out running tools) and continues the turn — immediate.
+        steering_mode: SteeringMode::StepBoundary,
+        // Effort levels are per model (catalog groups, see `devin_models`)
+        // and applied through the session's `thought_level` option.
         reasoning_levels: &[],
         prompt_transform: identity_transform,
-        effort_values: default_effort_values,
+        effort_values: devin_effort_values,
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: None,
@@ -342,6 +360,7 @@ fn devin_spec() -> AcpAgentSpec {
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
     }
 }
 
@@ -371,6 +390,7 @@ fn deepseek_harness_spec() -> AcpAgentSpec {
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
     }
 }
 
@@ -441,6 +461,7 @@ fn hermes_spec() -> AcpAgentSpec {
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
     }
 }
 
@@ -480,8 +501,9 @@ fn pi_spec() -> AcpAgentSpec {
                 options: Vec::new(),
             }]
         },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
+        // No `_session/steering` extension: a steer preempts the generation
+        // (waiting out running tools) and continues the turn — immediate.
+        steering_mode: SteeringMode::StepBoundary,
         // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
         // equivalent and is left to the agent default).
         reasoning_levels: &[
@@ -502,6 +524,7 @@ fn pi_spec() -> AcpAgentSpec {
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
     }
 }
 
@@ -645,6 +668,22 @@ fn configured_auth_method_in(path: &Path) -> Result<Option<ConfiguredAuthMethod>
         .map(ConfiguredAuthMethod::new))
 }
 
+/// Antigravity's `GEMINI_HOME`, resolved exactly as a launch resolves it —
+/// the directory whose `antigravity-acp/` holds its settings and tokens.
+pub fn antigravity_home() -> Result<PathBuf, HarnessError> {
+    antigravity_paths::home()
+}
+
+/// The auth method Antigravity's server saved in `settings.json` (it records
+/// every successful `authenticate`), canonicalized the way sign-in reads it.
+/// `None` when nothing is saved or the file can't be read.
+pub fn antigravity_saved_auth_method(home: &Path) -> Option<String> {
+    configured_auth_method_in(&home.join("antigravity-acp").join("settings.json"))
+        .ok()
+        .flatten()
+        .map(|method| method.canonical)
+}
+
 fn sign_in_auth_method(
     initialized: &Value,
     default_method: &str,
@@ -784,6 +823,9 @@ fn antigravity_spec() -> AcpAgentSpec {
                 },
             ]
         },
+        // No preemption: agy_acp_server 1.1.1 never answers a prompt (or any
+        // later one) when a cancel lands as it starts replying after a tool
+        // (verified on the wire). Steers wait for the turn end instead.
         steering_mode: SteeringMode::TurnBoundary,
         reasoning_levels: &[],
         prompt_transform: identity_transform,
@@ -798,6 +840,7 @@ fn antigravity_spec() -> AcpAgentSpec {
         auth_method: Some("oauth-personal"),
         skill_dirs: antigravity_skill_dirs,
         hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
     }
 }
 
@@ -807,6 +850,25 @@ const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(330);
 /// sign-out is local credential removal; this bound covers the server's cold
 /// start.
 const SIGN_OUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How [`AcpHarness::sign_in_with`] runs the agent's own sign-in.
+#[derive(Debug, Clone, Default)]
+pub struct SignInOptions {
+    /// `$BROWSER` for the agent: a no-op keeps it from opening a second tab
+    /// when the caller opens the reported url itself; a recording script
+    /// captures a url the agent never prints.
+    pub browser: Option<PathBuf>,
+    /// The `authenticate` method, overriding the spec's default — Devin has
+    /// no default (`devin-browser` is its browser sign-in).
+    pub method: Option<String>,
+    /// Extra environment. A throwaway data home (`XDG_DATA_HOME`, …) lands a
+    /// NEW login there, leaving the live one untouched.
+    pub env: Vec<(String, std::ffi::OsString)>,
+    /// Which printed urls are the sign-in page. `None` = the first url the
+    /// agent prints (Antigravity prints nothing else); a filter keeps a url
+    /// in some unrelated handshake field from being announced instead.
+    pub url_filter: Option<fn(&str) -> bool>,
+}
 
 /// milestones of [`AcpHarness::sign_in`] a caller can surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,7 +1027,8 @@ impl AcpHarness {
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
-        let (_scratch, mut child, _stderr) = self.spawn_agent(home.as_deref(), false, &[]).await?;
+        let (_scratch, mut child, _stderr) =
+            self.spawn_agent(home.as_deref(), false, &[], None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1000,12 +1063,36 @@ impl AcpHarness {
         browser: Option<PathBuf>,
         on_progress: impl Fn(SignInProgress) + Send + Sync + 'static,
     ) -> Result<(), HarnessError> {
+        self.sign_in_with(
+            SignInOptions {
+                browser,
+                ..Default::default()
+            },
+            on_progress,
+        )
+        .await
+    }
+
+    /// [`Self::sign_in`] with an explicit method, extra environment and url
+    /// filter (see [`SignInOptions`]).
+    pub async fn sign_in_with(
+        &self,
+        options: SignInOptions,
+        on_progress: impl Fn(SignInProgress) + Send + Sync + 'static,
+    ) -> Result<(), HarnessError> {
+        let SignInOptions {
+            browser,
+            method,
+            env,
+            url_filter,
+        } = options;
         let display_name = self.spec.display_name;
-        let Some(default_method) = self.spec.auth_method else {
+        let Some(default_method) = method.as_deref().or(self.spec.auth_method) else {
             return Err(HarnessError::Protocol(format!(
                 "{display_name} has no sign-in flow"
             )));
         };
+        let accept_url = move |url: &str| url_filter.is_none_or(|accept| accept(url));
         let (exe, args) = self.resolve_program(false).await?;
         let gemini_home = (self.spec.id == HarnessId::Antigravity)
             .then(antigravity_paths::home)
@@ -1030,6 +1117,9 @@ impl AcpHarness {
         if let Some(browser) = browser {
             cmd.env("BROWSER", browser);
         }
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         let scratch = self.adapter_scratch()?;
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
@@ -1053,8 +1143,13 @@ impl AcpHarness {
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::acp", "sign-in stderr: {line}");
-                    if let Some(url) = sign_in_url(&line)
+                    // Sign-in output carries authorize urls and device codes.
+                    tracing::debug!(
+                        target: "zeron_harness::acp",
+                        "sign-in stderr: {}",
+                        crate::redact::redact_output(&line)
+                    );
+                    if let Some(url) = sign_in_url(&line).filter(|url| accept_url(url))
                         && !announced.swap(true, std::sync::atomic::Ordering::AcqRel)
                     {
                         on_progress(SignInProgress::OpenBrowser(url));
@@ -1067,7 +1162,7 @@ impl AcpHarness {
                 stdin,
                 stdout,
                 Some(Box::new(move |line| {
-                    if let Some(url) = sign_in_url(line)
+                    if let Some(url) = sign_in_url(line).filter(|url| accept_url(url))
                         && !announced.swap(true, std::sync::atomic::Ordering::AcqRel)
                     {
                         on_progress(SignInProgress::OpenBrowser(url));
@@ -1274,6 +1369,21 @@ impl AcpHarness {
         }
     }
 
+    /// The agent's own CLI running `args` (`grok login`, `hermes auth add`),
+    /// resolved exactly as a launch resolves it — the env override, PATH, the
+    /// login shell, install dirs, the managed npm install — minus the ACP
+    /// server arguments. Only meaningful for agents whose server IS their CLI
+    /// (Grok, Devin, Hermes); Pi's server is a separate adapter.
+    pub async fn cli_command(&self, args: &[&str]) -> Result<Command, HarnessError> {
+        let (exe, mut launch_args) = self.resolve_program(false).await?;
+        let prefix = launch_args.len().saturating_sub(self.spec.args.len());
+        launch_args.truncate(prefix);
+        let mut cmd = Command::new(&exe);
+        cmd.args(launch_args).args(args);
+        crate::compose_child_path(&mut cmd, &exe);
+        Ok(cmd)
+    }
+
     fn configure_adapter_environment(&self, cmd: &mut Command, executable: &Path) {
         if self.spec.id == HarnessId::Antigravity
             && let Some(parent) = executable.parent()
@@ -1297,6 +1407,7 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
+        mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -1318,6 +1429,13 @@ impl AcpHarness {
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
         }
+        let scratch = if self.spec.id == HarnessId::Pi
+            && let Some(mcp) = mcp
+        {
+            Some(pi_mcp::configure(&mut cmd, mcp)?)
+        } else {
+            scratch
+        };
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1355,7 +1473,7 @@ impl AcpHarness {
         cwd: Option<&std::path::Path>,
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (_scratch, mut child, _stderr) = self
-            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[])
+            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None)
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1422,7 +1540,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
+        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1951,8 +2069,9 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (scratch, mut child, stderr_tail) =
-            self.spawn_agent(Some(&request.cwd), true, &[]).await?;
+        let (scratch, mut child, stderr_tail) = self
+            .spawn_agent(Some(&request.cwd), true, &[], request.mcp.as_ref())
+            .await?;
         let stdin = child
             .stdin
             .take()
@@ -1963,6 +2082,37 @@ impl Harness for AcpHarness {
             .ok_or_else(|| HarnessError::Protocol("agent child has no stdout".into()))?;
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+        let devin_selection = match request.model.as_deref() {
+            Some(model) if self.spec.id == HarnessId::Devin => {
+                let (exe, _) = self.resolve_program(false).await?;
+                let selection = self
+                    .devin_models
+                    .selection(
+                        &exe,
+                        self.model_discovery_timeout,
+                        model,
+                        &request.model_options,
+                    )
+                    .await;
+                if selection.is_none() && model == devin_models::FUSION {
+                    let chosen = |key: &str| {
+                        request
+                            .model_options
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("default")
+                            .to_owned()
+                    };
+                    return Err(HarnessError::Protocol(format!(
+                        "Devin Fusion does not offer lead {} with sidekick {}; pick another sidekick",
+                        chosen("lead"),
+                        chosen("sidekick")
+                    )));
+                }
+                selection
+            }
+            _ => None,
+        };
         tokio::spawn(run_session(Session {
             child,
             scratch,
@@ -1976,6 +2126,9 @@ impl Harness for AcpHarness {
             prompt_transform: self.spec.prompt_transform,
             effort_values: self.spec.effort_values,
             prompt_complete_extension: self.spec.prompt_complete_extension,
+            preempt_steers: self.spec.steering_mode == SteeringMode::StepBoundary,
+            devin_selection,
+            resend_unstarted: self.spec.drops_unstarted_cancelled_prompt,
             prompt_stall: self.spec.prompt_stall,
             stall_hint: self.spec.stall_hint,
             effort_in_model_id: self.spec.effort_in_model_id,
@@ -2014,6 +2167,12 @@ struct Session {
     harness: HarnessId,
     agent_name: &'static str,
     prompt_complete_extension: bool,
+    /// Steers preempt the generation (descriptor: mid-turn steering).
+    preempt_steers: bool,
+    /// Devin: the requested model's catalog group (see `devin_models`).
+    devin_selection: Option<devin_models::Selection>,
+    /// See `AcpAgentSpec::drops_unstarted_cancelled_prompt`.
+    resend_unstarted: bool,
     prompt_stall: Option<Duration>,
     stall_hint: &'static str,
     effort_in_model_id: bool,
@@ -2052,6 +2211,27 @@ fn initialize_params(harness: HarnessId) -> Value {
         // the diff pane, and commands belong to the agent's own sandbox.
         "clientCapabilities": capabilities,
     })
+}
+
+/// `session/new` `mcpServers` for an injected server: ACP spells a stdio
+/// server as name/command/args plus `[{name, value}]` env pairs. Empty when
+/// the host injected nothing — the user's own servers come from the agent's
+/// config, never from here.
+fn acp_mcp_servers(mcp: Option<&zeron_proto::McpServer>) -> Vec<Value> {
+    mcp.into_iter()
+        .map(|mcp| {
+            json!({
+                "name": mcp.name,
+                "command": mcp.command,
+                "args": mcp.args,
+                "env": mcp
+                    .env
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
@@ -2502,16 +2682,16 @@ fn prompt_turn(
     text: String,
     prompt_id: Option<String>,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
-    Box::pin(async move {
-        let mut params = json!({
-            "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": text }],
-        });
-        if let Some(id) = prompt_id {
-            params["_meta"] = json!({ "promptId": id, "requestId": id });
-        }
-        client.request("session/prompt", params).await
-    })
+    let mut params = json!({
+        "sessionId": session_id,
+        "prompt": [{ "type": "text", "text": text }],
+    });
+    if let Some(id) = prompt_id {
+        params["_meta"] = json!({ "promptId": id, "requestId": id });
+    }
+    // Written now, not on first poll: a steer's `session/cancel` issued in
+    // the same loop iteration must reach the agent after this prompt.
+    client.request_now("session/prompt", params)
 }
 
 /// Setup/discovery has no user-input bridge. Cancel stray permissions rather
@@ -2639,6 +2819,14 @@ fn handle_server_request_live(
     Vec::new()
 }
 
+/// Where an agent that signs in from settings sends a signed-out run: the
+/// provider's Accounts section, whose connect flow is the same for every agent.
+fn not_signed_in(agent_name: &str) -> String {
+    format!(
+        "{agent_name} isn't signed in. Open Settings → Providers → {agent_name} and connect an account."
+    )
+}
+
 /// `session/new`. Agents that sign in from Settings never start a browser
 /// sign-in mid-chat; an auth_required answer points the user there instead.
 async fn new_session(
@@ -2650,9 +2838,7 @@ async fn new_session(
 ) -> Result<Value, HarnessError> {
     match request_draining(client, incoming, "session/new", params).await {
         Err(error) if signs_in_from_settings && is_auth_required(&error) => {
-            Err(HarnessError::Protocol(format!(
-                "{agent_name} isn't signed in. Use Settings → Agents → Sign in."
-            )))
+            Err(HarnessError::Protocol(not_signed_in(agent_name)))
         }
         other => other,
     }
@@ -2957,6 +3143,9 @@ async fn run_session(session: Session) {
         harness,
         agent_name,
         prompt_complete_extension,
+        preempt_steers,
+        devin_selection,
+        resend_unstarted,
         prompt_stall,
         stall_hint,
         effort_in_model_id,
@@ -2984,7 +3173,10 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        let session_params = json!({
+            "cwd": request.cwd,
+            "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
+        });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
@@ -2996,9 +3188,7 @@ async fn run_session(session: Session) {
             match request_draining(&client, &mut incoming, resume_method, load).await {
                 Ok(resp) => (resume.clone(), resp),
                 Err(e) if auth_method.is_some() && is_auth_required(&e) => {
-                    return Err(HarnessError::Protocol(format!(
-                        "{agent_name} isn't signed in. Use Settings → Agents → Sign in."
-                    )));
+                    return Err(HarnessError::Protocol(not_signed_in(agent_name)));
                 }
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
@@ -3048,17 +3238,32 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
+        // Devin selects one advertised member of the requested model's group;
+        // effort and speed baked into a saved id apply unless the run chose
+        // its own.
+        let mut request = request.clone();
         if harness == HarnessId::Devin
-            && let Some(model) = request.model.as_deref()
+            && let Some(model) = request.model.clone()
         {
-            devin_models::wait_for_model(
+            let selection = devin_selection.clone().unwrap_or_default();
+            let advertised = devin_models::wait_for_model(
                 &client,
                 &mut incoming,
                 &session_id,
                 &mut session_response,
-                model,
+                &model,
+                &selection.members,
             )
             .await?;
+            request.model = Some(advertised);
+            if request.reasoning.is_none() {
+                request.reasoning = selection.effort;
+            }
+            if selection.fast && !request.model_options.contains_key("speed") {
+                request
+                    .model_options
+                    .insert("speed".into(), Value::String("fast".into()));
+            }
         }
         // ACP has had two model-selection surfaces. Newer config-option agents
         // use category=model below; Grok Build currently advertises only the
@@ -3121,56 +3326,87 @@ async fn run_session(session: Session) {
         } else {
             session_commands
         };
-        let options_snapshot = session_response;
-        for (config_id, payload) in config_option_sets(
+        let mut options_snapshot = session_response;
+        let mut sets = config_option_sets(
             &options_snapshot,
             requested_model.as_deref(),
             &efforts,
             &request.model_options,
-        ) {
-            let mut params = serde_json::Map::new();
-            params.insert("sessionId".into(), session_id.clone().into());
-            params.insert("configId".into(), config_id.clone().into());
-            if let Some(payload) = payload.as_object() {
-                for (k, v) in payload {
-                    params.insert(k.clone(), v.clone());
+        );
+        // Devin's effort and speed choices depend on the selected model:
+        // switch the model first, then choose them from what it offers.
+        let deferred = harness == HarnessId::Devin
+            && sets
+                .iter()
+                .any(|(id, _)| is_model_config_option(&options_snapshot, id));
+        if deferred {
+            sets.retain(|(id, _)| is_model_config_option(&options_snapshot, id));
+        }
+        let mut pass = 0;
+        loop {
+            for (config_id, payload) in std::mem::take(&mut sets) {
+                let mut params = serde_json::Map::new();
+                params.insert("sessionId".into(), session_id.clone().into());
+                params.insert("configId".into(), config_id.clone().into());
+                if let Some(payload) = payload.as_object() {
+                    for (k, v) in payload {
+                        params.insert(k.clone(), v.clone());
+                    }
+                }
+                match request_draining(
+                    &client,
+                    &mut incoming,
+                    "session/set_config_option",
+                    Value::Object(params),
+                )
+                .await
+                {
+                    Ok(response) => {
+                        if let Some(options) = response.get("configOptions") {
+                            options_snapshot["configOptions"] = options.clone();
+                        }
+                    }
+                    Err(e) => {
+                        if options_snapshot["configOptions"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|o| {
+                                o["id"].as_str() == Some(&config_id)
+                                    && o["category"].as_str() == Some("mode")
+                            })
+                        {
+                            return Err(HarnessError::Protocol(format!(
+                                "agent rejected approval mode: {e}"
+                            )));
+                        }
+                        if matches!(harness, HarnessId::Antigravity | HarnessId::Devin)
+                            && requested_model.is_some()
+                            && is_model_config_option(&options_snapshot, &config_id)
+                        {
+                            return Err(HarnessError::Protocol(format!(
+                                "agent rejected requested model {}: {e}",
+                                requested_model.as_deref().unwrap_or_default()
+                            )));
+                        }
+                        tracing::debug!(
+                            target: "zeron_harness::acp",
+                            "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
+                        );
+                    }
                 }
             }
-            if let Err(e) = request_draining(
-                &client,
-                &mut incoming,
-                "session/set_config_option",
-                Value::Object(params),
-            )
-            .await
-            {
-                if options_snapshot["configOptions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|o| {
-                        o["id"].as_str() == Some(&config_id)
-                            && o["category"].as_str() == Some("mode")
-                    })
-                {
-                    return Err(HarnessError::Protocol(format!(
-                        "agent rejected approval mode: {e}"
-                    )));
-                }
-                if matches!(harness, HarnessId::Antigravity | HarnessId::Devin)
-                    && requested_model.is_some()
-                    && is_model_config_option(&options_snapshot, &config_id)
-                {
-                    return Err(HarnessError::Protocol(format!(
-                        "agent rejected requested model {}: {e}",
-                        requested_model.as_deref().unwrap_or_default()
-                    )));
-                }
-                tracing::debug!(
-                    target: "zeron_harness::acp",
-                    "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
-                );
+            pass += 1;
+            if !deferred || pass > 1 {
+                break;
             }
+            sets = config_option_sets(
+                &options_snapshot,
+                requested_model.as_deref(),
+                &efforts,
+                &request.model_options,
+            );
+            sets.retain(|(id, _)| !is_model_config_option(&options_snapshot, id));
         }
         Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
             session_id,
@@ -3306,11 +3542,14 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+    // The text of the prompt in flight (re-sent by a preempt when the agent
+    // drops an unstarted cancelled prompt).
+    let mut current_prompt_text = prompt_transform(request.reasoning, &request.prompt);
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_turn(
             client.clone(),
             session_id.clone(),
-            prompt_transform(request.reasoning, &request.prompt),
+            current_prompt_text.clone(),
             current_prompt_id.clone(),
         )
     });
@@ -3326,6 +3565,16 @@ async fn run_session(session: Session) {
     let mut steering_call: Option<(String, BoxFuture<'static, Result<Value, HarnessError>>)> = None;
     let mut steer_backlog: VecDeque<String> = VecDeque::new();
     let mut steering_open = true;
+    // Immediate steering for agents without a mid-turn steering extension:
+    // a steer cancels the current generation (never a running tool — it
+    // waits for open tools to finish) and the cancelled turn continues as the
+    // steer's prompt in the same session, the way Codex `turn/steer` behaves.
+    let mut preempt_pending = false;
+    let mut preempt_sent = false;
+    // The prompt (`prompt_seq`) that last showed progress (text, thought,
+    // tool or plan). Pi and Devin keep a prompt cancelled before that in
+    // their history; Grok drops it, so its preempt re-sends the text.
+    let mut progress_seq: u64 = 0;
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut done_current = false;
@@ -3500,45 +3749,65 @@ async fn run_session(session: Session) {
                 {
                     break 'main;
                 }
-                let (status, mut error) = stop_outcome(&res, interrupted);
-                if !interrupted && auth_method.is_some() && res.as_ref().is_err_and(is_auth_required) {
-                    error = Some(format!("{agent_name} isn't signed in. Use Settings → Agents → Sign in."));
-                }
-                done_current = true;
-                if interrupted {
-                    done_after_interrupt = true;
-                }
-                if !send(
-                    &event_tx,
-                    AgentEvent::Done {
-                        status,
-                        result: None,
-                        error,
-                        session_id: Some(session_id.clone()),
-                    },
-                )
-                .await
-                {
-                    break 'main;
-                }
-                if interrupted || res.is_err() {
-                    break 'main;
-                }
-                // Persistent session: a queued steer becomes the next turn;
-                // otherwise stay alive for the mailbox — the caller owns
-                // teardown (mirrors the codex harness).
-                if let Some(text) = queued_steers.pop_front() {
-                    let (prev, next) = rotate(&mut assistant_message_id);
+                // A steer preempted this turn: the session lives on and the
+                // steers continue it below, so there is no turn end to report.
+                let preempted = std::mem::take(&mut preempt_sent)
+                    && !interrupted
+                    && res.is_ok()
+                    && !queued_steers.is_empty();
+                preempt_pending = false;
+                if !preempted {
+                    let (status, mut error) = stop_outcome(&res, interrupted);
+                    if !interrupted
+                        && auth_method.is_some()
+                        && res.as_ref().is_err_and(is_auth_required)
+                    {
+                        error = Some(not_signed_in(agent_name));
+                    }
+                    done_current = true;
+                    if interrupted {
+                        done_after_interrupt = true;
+                    }
                     if !send(
                         &event_tx,
-                        AgentEvent::Steered {
-                            assistant_message_id: Some(prev),
-                            next_assistant_message_id: Some(next),
+                        AgentEvent::Done {
+                            status,
+                            result: None,
+                            error,
+                            session_id: Some(session_id.clone()),
                         },
                     )
                     .await
                     {
                         break 'main;
+                    }
+                    if interrupted || res.is_err() {
+                        break 'main;
+                    }
+                }
+                // Persistent session: queued steers become the next prompt —
+                // all of them at once, each confirmed by its own Steered
+                // boundary; otherwise stay alive for the mailbox — the caller
+                // owns teardown (mirrors the codex harness).
+                if !queued_steers.is_empty() {
+                    let mut texts = Vec::with_capacity(queued_steers.len() + 1);
+                    if preempted && resend_unstarted && progress_seq != prompt_seq {
+                        texts.push(std::mem::take(&mut current_prompt_text));
+                    }
+                    while let Some(text) = queued_steers.pop_front() {
+                        let (prev, next) = rotate(&mut assistant_message_id);
+                        if !send(
+                            &event_tx,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
+                            },
+                        )
+                        .await
+                        {
+                            break 'main;
+                        }
+                        texts.push(text);
                     }
                     done_current = false;
                     open_tools.clear();
@@ -3548,10 +3817,11 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    current_prompt_text = texts.join("\n\n");
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        current_prompt_text.clone(),
                         current_prompt_id.clone(),
                     ));
                 } else if !steering_open {
@@ -3585,6 +3855,20 @@ async fn run_session(session: Session) {
                         );
                     if !boilerplate {
                         prompt_stall_deadline = None;
+                    }
+                    if method == "session/update" {
+                        match params
+                            .get("update")
+                            .and_then(|u| u.get("sessionUpdate"))
+                            .and_then(Value::as_str)
+                        {
+                            Some("agent_message_chunk")
+                            | Some("agent_thought_chunk")
+                            | Some("tool_call")
+                            | Some("tool_call_update")
+                            | Some("plan") => progress_seq = prompt_seq,
+                            _ => {}
+                        }
                     }
                     // `_x.ai/session/prompt_complete` — the AUTHORITATIVE
                     // turn end for agents advertising it (grok): the
@@ -3636,6 +3920,16 @@ async fn run_session(session: Session) {
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
+                    }
+                    // A waiting steer preempts once no tool is open and the
+                    // agent is generating again.
+                    if preempt_pending
+                        && !preempt_sent
+                        && turn.is_some()
+                        && open_tools.is_empty()
+                    {
+                        client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
+                        preempt_sent = true;
                     }
                 }
                 Some(Incoming::Request { id, method, params }) => {
@@ -3834,6 +4128,7 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    current_prompt_text = text.clone();
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -3883,6 +4178,7 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    current_prompt_text = text.clone();
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -3955,6 +4251,7 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    current_prompt_text = text.clone();
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -4018,6 +4315,7 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    current_prompt_text = text.clone();
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
@@ -4036,8 +4334,20 @@ async fn run_session(session: Session) {
                             steering_call = Some((text, fut));
                         }
                     } else {
-                        // No extension (Grok today): turn-boundary delivery.
+                        // No extension: preempt the generation and continue
+                        // the turn with this steer (see `preempt_pending`).
                         queued_steers.push_back(text);
+                        preempt_pending = preempt_steers;
+                        if preempt_pending
+                            && !preempt_sent
+                            && open_tools.is_empty()
+                        {
+                            client.notify(
+                                "session/cancel",
+                                Some(json!({ "sessionId": session_id })),
+                            );
+                            preempt_sent = true;
+                        }
                     }
                 }
                 None => {
@@ -5268,4 +5578,32 @@ fn explicit_program_launches_do_not_get_archive_scratch_roots() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh"),
     );
     assert!(harness.adapter_scratch().unwrap().is_none());
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[test]
+    fn acp_mcp_servers_spell_env_as_name_value_pairs_and_default_empty() {
+        assert!(acp_mcp_servers(None).is_empty());
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_IPC_PORT".to_owned(), "27654".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let servers = acp_mcp_servers(Some(&mcp));
+        assert_eq!(
+            servers,
+            vec![json!({
+                "name": "zeron",
+                "command": "/opt/zeron/zeron",
+                "args": ["mcp"],
+                "env": [{ "name": "ZERON_IPC_PORT", "value": "27654" }],
+            })]
+        );
+    }
 }
