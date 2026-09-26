@@ -70,6 +70,10 @@ pub struct CheckoutIdentity {
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
 pub(crate) fn home_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()) {
+        return PathBuf::from(profile);
+    }
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -1293,6 +1297,26 @@ impl Repos {
         timeout: Duration,
         hang_for_test: bool,
     ) -> Result<FolderListing, EngineError> {
+        self.list_folders_options(path, timeout, hang_for_test, false)
+            .await
+    }
+
+    pub async fn list_folders_show_hidden(
+        &self,
+        path: Option<String>,
+        show_hidden: bool,
+    ) -> Result<FolderListing, EngineError> {
+        self.list_folders_options(path, FOLDER_LIST_TIMEOUT, false, show_hidden)
+            .await
+    }
+
+    async fn list_folders_options(
+        &self,
+        path: Option<String>,
+        timeout: Duration,
+        hang_for_test: bool,
+        show_hidden: bool,
+    ) -> Result<FolderListing, EngineError> {
         let target = match path.filter(|p| !p.trim().is_empty()) {
             Some(p) => absolutize(Path::new(&p)),
             None => home_dir(),
@@ -1306,7 +1330,7 @@ impl Repos {
                     // exit reclaims it) — the caller must hit its timeout.
                     std::thread::sleep(Duration::from_secs(3600));
                 }
-                let _ = tx.send(list_folders_blocking(&target));
+                let _ = tx.send(list_folders_blocking(&target, show_hidden));
             });
         if let Err(err) = spawned {
             return Err(EngineError::Other(format!("folder listing failed: {err}")));
@@ -1362,7 +1386,7 @@ async fn disposable_worker<T: Send + 'static>(
 
 /// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
 /// existence probe per directory entry.
-fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
+fn list_folders_blocking(target: &Path, show_hidden: bool) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
             EngineError::Other("Zeron doesn't have access to this folder on the device.".into())
@@ -1372,7 +1396,16 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     let mut entries: Vec<FolderEntry> = Vec::new();
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        let hidden = name.starts_with('.');
+        #[cfg(windows)]
+        let hidden = hidden || {
+            use std::os::windows::fs::MetadataExt;
+            entry
+                .metadata()
+                .map(|m| m.file_attributes() & 2 != 0)
+                .unwrap_or(false)
+        };
+        if hidden && !show_hidden {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -2151,6 +2184,17 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn folder_browser_can_reveal_hidden_directories() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("visible")).unwrap();
+        std::fs::create_dir(root.path().join(".hidden")).unwrap();
+        let normal = super::list_folders_blocking(root.path(), false).unwrap();
+        assert_eq!(normal.entries.len(), 1);
+        let all = super::list_folders_blocking(root.path(), true).unwrap();
+        assert_eq!(all.entries.len(), 2);
+        assert!(all.entries.iter().any(|e| e.name == ".hidden" && e.is_dir));
+    }
     use super::*;
 
     fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {

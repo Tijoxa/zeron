@@ -288,6 +288,8 @@ struct RunProjectActionParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    show_hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2418,7 +2420,7 @@ impl RpcService for EngineRpc {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
                     .repos
-                    .list_folders(p.path)
+                    .list_folders_show_hidden(p.path, p.show_hidden)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)

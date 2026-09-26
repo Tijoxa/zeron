@@ -111,13 +111,36 @@ fn service_tier() -> ModelOption {
     }
 }
 
+pub(crate) fn approval_mode() -> ModelOption {
+    ModelOption {
+        id: "approvalMode".into(),
+        label: "Approvals".into(),
+        default_choice: "on-request".into(),
+        choices: vec![
+            ModelOptionChoice {
+                id: "on-request".into(),
+                label: "Ask for approval".into(),
+            },
+            ModelOptionChoice {
+                id: "auto-review".into(),
+                label: "Approve for me".into(),
+            },
+            ModelOptionChoice {
+                id: "never".into(),
+                label: "Full access (no approvals)".into(),
+            },
+        ],
+    }
+}
+
 fn model(
     id: &str,
     label: &str,
     description: &str,
     ladder: &[ReasoningLevel],
-    options: Vec<ModelOption>,
+    mut options: Vec<ModelOption>,
 ) -> Model {
+    options.push(approval_mode());
     Model {
         id: id.into(),
         label: label.into(),
@@ -240,6 +263,7 @@ mod tests {
             .expect("daybreak blue in catalog");
         assert_eq!(daybreak.label, "Daybreak Blue");
         assert!(daybreak.reasoning_levels.contains(&ReasoningLevel::Ultra));
-        assert!(daybreak.options.is_empty());
+        assert_eq!(daybreak.options.len(), 1);
+        assert_eq!(daybreak.options[0].id, "approvalMode");
     }
 }

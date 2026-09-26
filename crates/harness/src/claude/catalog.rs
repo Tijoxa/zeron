@@ -125,13 +125,44 @@ const XHIGH_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Ultrathink,
 ];
 
+pub(crate) fn approval_mode() -> ModelOption {
+    ModelOption {
+        id: "approvalMode".into(),
+        label: "Approvals".into(),
+        default_choice: "default".into(),
+        choices: vec![
+            ModelOptionChoice {
+                id: "default".into(),
+                label: "Ask when needed".into(),
+            },
+            ModelOptionChoice {
+                id: "acceptEdits".into(),
+                label: "Accept edits".into(),
+            },
+            ModelOptionChoice {
+                id: "plan".into(),
+                label: "Plan".into(),
+            },
+            ModelOptionChoice {
+                id: "dontAsk".into(),
+                label: "Only pre-approved tools".into(),
+            },
+            ModelOptionChoice {
+                id: "bypassPermissions".into(),
+                label: "Full access (no approvals)".into(),
+            },
+        ],
+    }
+}
+
 fn model(
     id: &str,
     label: &str,
     description: &str,
     ladder: &[ReasoningLevel],
-    options: Vec<ModelOption>,
+    mut options: Vec<ModelOption>,
 ) -> Model {
+    options.push(approval_mode());
     Model {
         id: id.into(),
         label: label.into(),
@@ -187,7 +218,7 @@ fn models_with_settings(path: &std::path::Path) -> Vec<Model> {
                 label: id.into(),
                 description: None,
                 reasoning_levels: FULL_LADDER.to_vec(),
-                options: vec![],
+                options: vec![approval_mode()],
             });
         }
     }
@@ -288,7 +319,7 @@ pub(super) fn with_discovered_models(
             label: text("displayName").unwrap_or(id).into(),
             description: text("description").map(str::to_owned),
             reasoning_levels: ladder,
-            options: vec![],
+            options: vec![approval_mode()],
         });
     }
     if !valid {

@@ -58,7 +58,7 @@ use crate::scratch::ScratchDir;
 use child::Child;
 pub(crate) mod child;
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{map_update, parse_commands};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
 
@@ -1537,11 +1537,37 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .collect()
         })
         .unwrap_or_default();
-    let wire_options: Vec<ModelOption> = config_options
+    let mut wire_options: Vec<ModelOption> = config_options
         .iter()
         .filter_map(trait_from_config_option)
         .collect();
 
+    if !wire_options.iter().any(|o| o.id == "approvalMode") {
+        if let Some(modes) = session_response.get("modes") {
+            let choices: Vec<ModelOptionChoice> = modes["availableModes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    Some(ModelOptionChoice {
+                        id: m["id"].as_str()?.into(),
+                        label: m["name"].as_str().unwrap_or(m["id"].as_str()?).into(),
+                    })
+                })
+                .collect();
+            if choices.len() > 1 {
+                wire_options.push(ModelOption {
+                    id: "approvalMode".into(),
+                    label: "Approval / mode".into(),
+                    default_choice: modes["currentModeId"]
+                        .as_str()
+                        .unwrap_or(&choices[0].id)
+                        .into(),
+                    choices,
+                });
+            }
+        }
+    }
     let exact = |id: &str| catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
     // Family-alias catalog row: the claude adapter advertises bare aliases
     // (`opus`, `sonnet`, `haiku`) meaning "the current generation" — match
@@ -1659,14 +1685,21 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 id,
                 m.get("name").and_then(Value::as_str),
                 m.get("description").and_then(Value::as_str),
-                exact(id).map(|k| k.options.clone()).unwrap_or_default(),
+                {
+                    let mut options = exact(id).map(|k| k.options.clone()).unwrap_or_default();
+                    options.retain(|o| {
+                        o.id != "approvalMode" && !wire_options.iter().any(|w| w.id == o.id)
+                    });
+                    options.extend(wire_options.clone());
+                    options
+                },
             ))
         })
         .collect()
 }
 
 /// A session config option surfaced as a Traits-dropdown section. Mode is
-/// zeron's own (forced to the no-prompts choice), model rides the model rows,
+/// selected by the user; model rides the model rows,
 /// and thought_level is the Reasoning ladder — everything else the agent
 /// advertises (fast mode, collaboration mode, agent persona, …) passes
 /// through. `currentValue` doubles as the default: it is the state the
@@ -1676,18 +1709,20 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
 fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
     if matches!(
         option.get("category").and_then(Value::as_str),
-        Some("mode" | "model" | "thought_level")
+        Some("model" | "thought_level")
     ) {
         return None;
     }
-    let id = option.get("id").and_then(Value::as_str)?;
+    let id = if option.get("category").and_then(Value::as_str) == Some("mode") {
+        "approvalMode"
+    } else {
+        option.get("id").and_then(Value::as_str)?
+    };
     let label = option.get("name").and_then(Value::as_str).unwrap_or(id);
     match option.get("type").and_then(Value::as_str)? {
         "select" => {
-            let choices: Vec<ModelOptionChoice> = option
-                .get("options")
-                .and_then(Value::as_array)?
-                .iter()
+            let choices: Vec<ModelOptionChoice> = config_choice_rows(option)
+                .into_iter()
                 .filter_map(|c| {
                     let id = c.get("value").and_then(Value::as_str)?;
                     Some(ModelOptionChoice {
@@ -2238,6 +2273,42 @@ fn is_model_config_option(session_response: &Value, config_id: &str) -> bool {
 /// Matched against advertised values and skipped when already current. Pure
 /// so it's testable; the returned value is the request's flattened `value`
 /// payload (select: `{"value": id}`, boolean: `{"type":"boolean","value": b}`).
+/// Validate explicit session modes before prompting; a stale or rejected
+/// permission selection must never silently run with different permissions.
+fn approval_mode_change(
+    session: &Value,
+    options: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, HarnessError> {
+    let Some(wanted) = options.get("approvalMode").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if let Some(config) = session["configOptions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|o| o["category"].as_str() == Some("mode"))
+    {
+        if config_choice_rows(config)
+            .iter()
+            .any(|c| c["value"].as_str() == Some(wanted))
+        {
+            return Ok(None);
+        }
+    } else if session["modes"]["availableModes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|m| m["id"].as_str() == Some(wanted))
+    {
+        return Ok(
+            (session["modes"]["currentModeId"].as_str() != Some(wanted)).then(|| wanted.to_owned())
+        );
+    }
+    Err(HarnessError::Protocol(format!(
+        "The agent no longer offers approval mode {wanted}. Select a supported mode."
+    )))
+}
+
 fn config_option_sets(
     session_response: &Value,
     model: Option<&str>,
@@ -2271,32 +2342,12 @@ fn config_option_sets(
             ("select", Some("model")) => model
                 .and_then(|m| pick_model_value(m, &available, context_1m))
                 .map(Value::String),
-            // Unattended parity with the retired custom adapters (claude
-            // bypassPermissions / codex approvalPolicy never): pick the
-            // no-prompts mode when the agent offers one. claude-agent-acp
-            // calls it `bypassPermissions`, codex-acp `agent-full-access`
-            // (approvalPolicy "never" + danger-full-access sandbox), Devin
-            // `bypass`. Cursor instead exposes agent/plan/ask — those arrive
-            // as a Traits "Mode" option and win when the run selected one.
             ("select", Some("mode")) => model_options
-                .get("mode")
+                .get("approvalMode")
+                .or_else(|| model_options.get(config_id))
                 .and_then(Value::as_str)
                 .filter(|c| available.contains(c))
-                .map(|c| Value::String(c.to_owned()))
-                .or_else(|| {
-                    [
-                        "bypassPermissions",
-                        "bypass_permissions",
-                        "bypass",
-                        "yolo",
-                        "agent-full-access",
-                        "danger-full-access",
-                        "full-access",
-                    ]
-                    .into_iter()
-                    .find(|v| available.contains(v))
-                    .map(|v| Value::String(v.to_owned()))
-                }),
+                .map(|c| Value::String(c.to_owned())),
             ("select", Some("thought_level")) => efforts
                 .iter()
                 .find(|c| available.contains(*c))
@@ -2463,32 +2514,17 @@ fn prompt_turn(
     })
 }
 
-/// Answer a server→client request. Permission requests are auto-accepted with
-/// the agent's preferred allow option — parity with the claude harness's
-/// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
-/// sessions run unattended). Everything else (fs, terminal, elicitation) was
-/// declined at initialize, so a stray request gets method-not-found rather
-/// than wedging the agent.
+/// Setup/discovery has no user-input bridge. Cancel stray permissions rather
+/// than granting access before the selected mode has been applied.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
-    params: &Value,
+    _params: &Value,
 ) -> Vec<AgentEvent> {
     match method {
         "session/request_permission" => {
-            let options: Vec<Value> = params
-                .get("options")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            match preferred_allow_option(&options) {
-                Some(option_id) => client.respond(
-                    &id,
-                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-                ),
-                None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
-            }
+            client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } }));
             Vec::new()
         }
         _ => {
@@ -2509,7 +2545,7 @@ type RequestInputFn = Box<
 /// its options lacks an allow/reject kind — that's how the agent relays
 /// user-facing choices (Claude's AskUserQuestion arrives this way through
 /// the adapter). Every option carrying an allow/reject kind means a real
-/// tool permission, which auto-accepts (unattended parity); kinds may
+/// tool permission; kinds may
 /// legitimately repeat — codex sends two `allow_always` options ("Allow for
 /// Session" and a prefix-rule amendment) on every exec approval.
 fn is_user_question(options: &[Value]) -> bool {
@@ -2521,8 +2557,7 @@ fn is_user_question(options: &[Value]) -> bool {
     })
 }
 
-/// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
+/// The live-run request handler: permissions and questions block on the
 /// engine's input bridge (in a subtask so the message loop keeps flowing)
 /// and answer with the option whose name matches the chosen label. A dropped
 /// resolver degrades to `cancelled` — never a silent allow.
@@ -2550,9 +2585,7 @@ fn handle_server_request_live(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if !is_user_question(&options) {
-        return handle_server_request(client, id, method, params);
-    }
+
     let names: Vec<String> = options
         .iter()
         .map(|o| {
@@ -2564,7 +2597,12 @@ fn handle_server_request_live(
         .collect();
     let question = UserInputQuestion {
         id: new_message_id(),
-        header: "Agent question".into(),
+        header: if is_user_question(&options) {
+            "Agent question"
+        } else {
+            "Approval required"
+        }
+        .into(),
         question: params
             .get("toolCall")
             .and_then(|t| t.get("title"))
@@ -3060,6 +3098,18 @@ async fn run_session(session: Session) {
                 HarnessError::Protocol(format!("agent rejected model switch to {model}: {error}"))
             })?;
         }
+        if let Some(mode) = approval_mode_change(&session_response, &request.model_options)? {
+            request_draining(
+                &client,
+                &mut incoming,
+                "session/set_mode",
+                json!({"sessionId": session_id, "modeId": mode}),
+            )
+            .await
+            .map_err(|e| {
+                HarnessError::Protocol(format!("agent rejected approval mode {mode}: {e}"))
+            })?;
+        }
         // Apply the run's model + effort + model options through the
         // session's advertised config options. Best-effort for effort and
         // traits: a rejected auxiliary set is logged and the agent default
@@ -3094,6 +3144,19 @@ async fn run_session(session: Session) {
             )
             .await
             {
+                if options_snapshot["configOptions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|o| {
+                        o["id"].as_str() == Some(&config_id)
+                            && o["category"].as_str() == Some("mode")
+                    })
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "agent rejected approval mode: {e}"
+                    )));
+                }
                 if matches!(harness, HarnessId::Antigravity | HarnessId::Devin)
                     && requested_model.is_some()
                     && is_model_config_option(&options_snapshot, &config_id)
@@ -4633,9 +4696,9 @@ mod tests {
                 .iter()
                 .map(|o| o.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["fast-mode"]
+            vec!["approvalMode", "fast-mode"]
         );
-        assert_eq!(models[0].options[0].default_choice, "off");
+        assert_eq!(models[0].options[1].default_choice, "off");
     }
 
     #[test]
@@ -4869,7 +4932,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_config_option_prefers_a_no_prompt_mode_per_adapter_naming() {
+    fn mode_config_option_preserves_default_and_applies_explicit_selection() {
         let codex = json!({
             "sessionId": "s-1",
             "configOptions": [{
@@ -4885,9 +4948,48 @@ mod tests {
             }],
         });
         let no_opts = serde_json::Map::new();
+        assert!(config_option_sets(&codex, None, &[], &no_opts).is_empty());
+        let mut selected = serde_json::Map::new();
+        selected.insert("approvalMode".into(), json!("agent-full-access"));
+        assert!(approval_mode_change(&codex, &selected).unwrap().is_none());
         assert_eq!(
-            config_option_sets(&codex, None, &[], &no_opts),
+            config_option_sets(&codex, None, &[], &selected),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
+        );
+        selected.insert("approvalMode".into(), json!("not-supported"));
+        assert!(approval_mode_change(&codex, &selected).is_err());
+    }
+
+    #[test]
+    fn approval_modes_support_legacy_sessions_and_grouped_config_choices() {
+        let session = json!({"models": {"availableModels": [{"modelId": "m"}]},
+            "modes": {"currentModeId": "ask", "availableModes": [
+                {"id": "ask", "name": "Ask"}, {"id": "auto", "name": "Automatic"}]}});
+        let models = models_from_session(&session, &[]);
+        assert_eq!(models[0].options[0].default_choice, "ask");
+        let mut selected = serde_json::Map::new();
+        selected.insert("approvalMode".into(), json!("auto"));
+        assert_eq!(
+            approval_mode_change(&session, &selected)
+                .unwrap()
+                .as_deref(),
+            Some("auto")
+        );
+        selected.insert("approvalMode".into(), json!("ask"));
+        assert_eq!(approval_mode_change(&session, &selected).unwrap(), None);
+        assert!(approval_mode_change(&json!({}), &selected).is_err());
+        let config = json!({"id":"permissions", "name":"Approvals", "category":"mode", "type":"select",
+            "currentValue":"ask", "options":[{"group":"permissions", "options":[
+                {"value":"ask", "name":"Ask"}, {"value":"auto", "name":"Automatic"}]}]});
+        let option = trait_from_config_option(&config).unwrap();
+        assert_eq!(option.id, "approvalMode");
+        assert_eq!(option.choices.len(), 2);
+        let mut resumed_config = config;
+        resumed_config["currentValue"] = json!("auto");
+        let resumed = json!({"configOptions": [resumed_config]});
+        assert_eq!(
+            config_option_sets(&resumed, None, &[], &selected),
+            vec![("permissions".into(), json!({"value":"ask"}))]
         );
     }
 

@@ -2013,6 +2013,7 @@ pub(super) struct AddSpaceFlow {
     drives: Loadable<Vec<DriveEntry>>,
     /// Requested browser path (`None` = the device's default, i.e. home).
     browser_path: Option<String>,
+    show_hidden: bool,
     /// The device's home (the path a `None` browse resolved to) — breadcrumbs
     /// fold everything up to here into the Home crumb.
     home: Option<String>,
@@ -5024,6 +5025,7 @@ impl Shell {
             browser: Loadable::Idle,
             drives: Loadable::Idle,
             browser_path: None,
+            show_hidden: false,
             home: None,
             browser_repo: false,
             active: 0,
@@ -5065,6 +5067,7 @@ impl Shell {
             input.set_text("", cx);
         });
         self.load_space_drives(cx);
+        self.add_space_goto_location("Home".into(), None, cx);
         cx.notify();
     }
 
@@ -5396,6 +5399,7 @@ impl Shell {
         flow.focus_pending = true;
         let device_id = flow.device.as_ref().map(|d| d.id.clone());
         let went_home = path.is_none();
+        let show_hidden = flow.show_hidden;
         flow.browser_path = path.clone();
         flow.browser = Loadable::Loading;
         flow.active = 0;
@@ -5407,6 +5411,7 @@ impl Shell {
         };
         flow.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
+            params.insert("showHidden".into(), serde_json::Value::Bool(show_hidden));
             if let Some(p) = &path {
                 params.insert("path".into(), serde_json::Value::String(p.clone()));
             }
@@ -6001,6 +6006,32 @@ impl Shell {
                     .text_size(crate::typography::ui_rems(15.0))
                     .child(search),
             )
+            .when(step == ProjectStep::Folders, |el| {
+                let shown = self.add_space.as_ref().is_some_and(|f| f.show_hidden);
+                el.child(
+                    div()
+                        .id("project-show-hidden")
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(6.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.element_hover))
+                        .child(if shown {
+                            "Hide hidden folders"
+                        } else {
+                            "Show hidden folders"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(flow) = this.add_space.as_mut() {
+                                flow.show_hidden = !flow.show_hidden;
+                                let path = flow.browser_path.clone();
+                                this.load_space_folders(path, cx);
+                            }
+                        })),
+                )
+            })
             .child(popover::key_hint_text(&theme, "esc", ""));
         let footer = div()
             .flex_none()
@@ -6480,9 +6511,13 @@ mod project_flow_tests {
             assert_eq!(shell.add_space_devices(cx).len(), 1);
             shell.add_space_open_active(cx);
             let flow = shell.add_space.as_mut().unwrap();
-            assert_eq!(flow.step, ProjectStep::Locations);
+            assert_eq!(flow.step, ProjectStep::Folders);
+            assert_eq!(flow.location, Some(("Home".into(), None)));
+            assert!(flow.browser_path.is_none());
             assert_eq!(flow.device.as_ref().unwrap().id, "remote");
             assert!(flow.search.read(cx).is_empty());
+            shell.add_space_back_to(ProjectStep::Locations, cx);
+            let flow = shell.add_space.as_mut().unwrap();
             flow.drives = Loadable::Ready(vec![DriveEntry {
                 name: "Projects".into(),
                 path: "/projects".into(),

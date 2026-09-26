@@ -11,8 +11,7 @@
 //!   live against 2.1.228: `can_use_tool` control requests arrive and
 //!   allow/deny responses are honored). The alternative channel — an MCP
 //!   permission tool — needs a server process and was rejected. Tool calls
-//!   auto-allow (zeron sessions run unattended, parity with the ACP
-//!   harness's preferred-allow behavior); `AskUserQuestion` round-trips
+//!   follow the selected approval mode; `AskUserQuestion` round-trips
 //!   through [`RunControls::request_input`].
 //! - DONE is the CLI's own `result` frame, eagerly: background work (a
 //!   spawned subagent) never holds the turn. The CLI natively runs a second
@@ -190,14 +189,27 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
+        if request
+            .model_options
+            .get("approvalMode")
+            .and_then(Value::as_str)
+            == Some("bypassPermissions")
+            || request.auto_approve
+        {
             cmd.args([
                 "--permission-mode",
                 "bypassPermissions",
                 "--dangerously-skip-permissions",
             ]);
         } else {
-            cmd.args(["--permission-mode", "default"]);
+            cmd.args([
+                "--permission-mode",
+                request
+                    .model_options
+                    .get("approvalMode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default"),
+            ]);
         }
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
@@ -500,10 +512,24 @@ impl Harness for ClaudeHarness {
 impl ClaudeHarness {
     async fn run_with_mode(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mode = request
+            .model_options
+            .get("approvalMode")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        if !matches!(
+            mode,
+            "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions"
+        ) {
+            return Err(HarnessError::Protocol(format!(
+                "Unsupported Claude approval mode: {mode}"
+            )));
+        }
+        request.auto_approve = !title_only && mode == "bypassPermissions";
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
         if title_only {
@@ -861,9 +887,8 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved
-/// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
+/// Serve one `can_use_tool` control request. Tool permissions require user
+/// approval whenever Claude requests it; `AskUserQuestion` is intercepted —
 /// surface the questions through the engine's input bridge (which owns the
 /// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
 /// (in a subtask so the frame loop keeps flowing), and hand them back keyed
@@ -881,8 +906,31 @@ fn handle_control_request(
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
-        let line = control_response_line(&req.request_id, allow_response(req.request.input));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+        let request_input = Arc::clone(request_input);
+        let stdin_tx = stdin_tx.clone();
+        tokio::spawn(async move {
+            let question = UserInputQuestion {
+                id: uuid::Uuid::new_v4().to_string(),
+                header: "Approval required".into(),
+                question: format!("Allow {}?\n{}", req.request.tool_name, req.request.input),
+                options: vec!["Allow".into(), "Deny".into()],
+                multi_select: false,
+            };
+            let question_id = question.id.clone();
+            let answers = (request_input)(vec![question]).await.unwrap_or_default();
+            let allow = answers
+                .iter()
+                .any(|a| a.question_id == question_id && a.labels == ["Allow"]);
+            let response = if allow {
+                allow_response(req.request.input)
+            } else {
+                serde_json::json!({"behavior": "deny", "message": "Permission denied by user"})
+            };
+            let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+                &req.request_id,
+                response,
+            )));
+        });
         return;
     }
     let request_input = Arc::clone(request_input);
@@ -980,6 +1028,46 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn approvals_require_an_explicit_allow_and_cancel_denies() {
+        for label in [Some("Allow"), Some("Deny"), None] {
+            let input: Arc<RequestInputFn> = Arc::new(Box::new(move |questions| {
+                assert_eq!(questions[0].header, "Approval required");
+                assert!(questions[0].question.contains("cargo test"));
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if let Some(label) = label {
+                    let _ = tx.send(vec![UserInputAnswer {
+                        question_id: questions[0].id.clone(),
+                        labels: vec![label.into()],
+                    }]);
+                }
+                rx
+            }));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let req = serde_json::from_value(json!({"request_id":"permission-1", "request": {
+                "subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":"cargo test"}
+            }}))
+            .unwrap();
+            handle_control_request(req, &input, &tx);
+            let StdinMsg::Line(line) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected response")
+            };
+            let value: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                value["response"]["response"]["behavior"],
+                if label == Some("Allow") {
+                    "allow"
+                } else {
+                    "deny"
+                }
+            );
+        }
+    }
 
     #[test]
     fn parses_questions_tolerantly() {

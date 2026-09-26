@@ -15,9 +15,8 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
-//!   the sandbox is forced to `danger-full-access` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs). Stray
+//! - Approvals + sandbox follow the selected mode: on-request/workspace-write
+//!   by default, never/danger-full-access for explicit full access. Requests
 //!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
@@ -338,6 +337,15 @@ fn reasoning_level(value: &str) -> Option<ReasoningLevel> {
 /// Codex accepts both names, but Zeron has historically persisted `fast`.
 /// Normalize the app server's `priority` id so live and fallback catalogs do
 /// not produce two different settings for the same tier.
+fn approval_reviewer(options: &serde_json::Map<String, Value>, title_only: bool) -> &'static str {
+    if !title_only && options.get("approvalMode").and_then(Value::as_str) == Some("auto-review") {
+        "auto_review"
+    } else {
+        // Explicitly reset the reviewer on resume after an automatic-review turn.
+        "user"
+    }
+}
+
 fn normalized_service_tier(value: &str) -> &str {
     match value {
         "priority" => "fast",
@@ -483,7 +491,10 @@ fn parse_model_list_page(result: &Value) -> (Vec<(Model, bool)>, Option<String>)
                     .and_then(reasoning_level)
             })
             .collect();
-        let options = model_service_tier(item).into_iter().collect();
+        let options = model_service_tier(item)
+            .into_iter()
+            .chain(Some(catalog::approval_mode()))
+            .collect();
         models.push((
             Model {
                 id: id.to_owned(),
@@ -678,17 +689,23 @@ impl CodexHarness {
             ));
         }
         let exe = self.resolve_executable()?;
-        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
-        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
-        // Parity with the Claude adapter, which auto-approves every
-        // can_use_tool and so effectively grants full access. This also
-        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
-        // worktree on a slash-named branch derives a malformed mount that
-        // kills every command.
+        let mode = request
+            .model_options
+            .get("approvalMode")
+            .and_then(Value::as_str)
+            .unwrap_or("on-request");
+        if !matches!(mode, "on-request" | "auto-review" | "never") {
+            return Err(HarnessError::Protocol(format!(
+                "Unsupported Codex approval mode: {mode}"
+            )));
+        }
+        request.auto_approve = !title_only && mode == "never";
         request.sandbox = if title_only {
             zeron_proto::SandboxLevel::ReadOnly
-        } else {
+        } else if request.auto_approve {
             zeron_proto::SandboxLevel::DangerFullAccess
+        } else {
+            zeron_proto::SandboxLevel::WorkspaceWrite
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -950,14 +967,14 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (zeron sessions run unattended; combined
-    // with the danger-full-access override above this is codex's yolo mode):
-    // never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // Full access is explicit; other sessions delegate approval decisions
+    // to Codex and surface its requests through the input bridge.
+    let approval_policy = if title_only || request.auto_approve {
+        "never"
+    } else {
+        "on-request"
+    };
+    let approvals_reviewer = approval_reviewer(&request.model_options, title_only);
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -998,6 +1015,7 @@ async fn run_session(session: Session) {
         }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
+        p.insert("approvalsReviewer".into(), approvals_reviewer.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
@@ -1106,6 +1124,7 @@ async fn run_session(session: Session) {
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), prompt_input(text));
         p.insert("approvalPolicy".into(), approval_policy.into());
+        p.insert("approvalsReviewer".into(), approvals_reviewer.into());
         p.insert(
             "sandboxPolicy".into(),
             sandbox_policy_value(request.sandbox),
@@ -1454,7 +1473,7 @@ async fn run_session(session: Session) {
                         id,
                         &method,
                         &params,
-                        request.auto_approve,
+                        false, // Honor any request the native policy still sends.
                         &request_input,
                     );
                 }
@@ -1897,6 +1916,24 @@ mod tests {
             &json!({"command": ["git", "push", "--force"]}),
         );
         assert!(q.question.contains("git push --force"));
+    }
+
+    #[test]
+    fn approval_reviewer_switches_back_to_user_and_never_reviews_titles() {
+        let mut options = serde_json::Map::new();
+        assert_eq!(approval_reviewer(&options, false), "user");
+        options.insert("approvalMode".into(), json!("auto-review"));
+        assert_eq!(approval_reviewer(&options, false), "auto_review");
+        assert_eq!(approval_reviewer(&options, true), "user");
+        for mode in ["on-request", "never"] {
+            options.insert("approvalMode".into(), json!(mode));
+            assert_eq!(approval_reviewer(&options, false), "user");
+        }
+        let choices = catalog::approval_mode().choices;
+        assert_eq!(
+            choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["on-request", "auto-review", "never"]
+        );
     }
 
     #[test]

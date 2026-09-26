@@ -922,6 +922,17 @@ impl Pickers {
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
+        let mut model_options = self.explicit_options(cx);
+        // Send the displayed permission default explicitly, including on
+        // resumed sessions that may previously have used full access.
+        if let Some(option) = self
+            .selected_model(cx)
+            .and_then(|m| m.options.iter().find(|o| o.id == "approvalMode"))
+        {
+            model_options
+                .entry(option.id.clone())
+                .or_insert_with(|| option.default_choice.clone().into());
+        }
         ResolvedRunConfig {
             harness: self.effective_harness(cx),
             model: self
@@ -930,7 +941,7 @@ impl Pickers {
                 // Catalog not loaded (offline): still send the id we know.
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
-            model_options: self.explicit_options(cx),
+            model_options,
         }
     }
 
@@ -1567,6 +1578,7 @@ impl Pickers {
         default: bool,
         cx: &mut Context<Self>,
     ) {
+        let default = default && option_id != "approvalMode";
         if self.state.read(cx).selected_chat.is_some() {
             self.update_chat_config(cx, move |config| {
                 if default {
@@ -4966,6 +4978,70 @@ mod tests {
                 .child(div().track_focus(&self.neutral))
                 .child(self.pickers.clone())
         }
+    }
+
+    #[gpui::test]
+    fn approval_selection_keeps_explicit_default_and_hides_for_unsupported_models(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults = ComposerDefaults::default();
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            let mut model = bare_model("test-model", "Test");
+            model.options.push(ModelOption {
+                id: "approvalMode".into(),
+                label: "Approvals".into(),
+                default_choice: "ask".into(),
+                choices: vec![
+                    ModelOptionChoice {
+                        id: "ask".into(),
+                        label: "Ask".into(),
+                    },
+                    ModelOptionChoice {
+                        id: "full".into(),
+                        label: "Full access".into(),
+                    },
+                ],
+            });
+            pickers.apply_model_catalog(HarnessId::Codex, Loadable::Ready(vec![model]), cx);
+            assert_eq!(pickers.resolved(cx).model_options["approvalMode"], "ask");
+            pickers.pick_option("approvalMode".into(), "full".into(), false, cx);
+            assert_eq!(pickers.resolved(cx).model_options["approvalMode"], "full");
+            pickers.pick_option("approvalMode".into(), "ask".into(), true, cx);
+            assert_eq!(pickers.explicit_options(cx)["approvalMode"], "ask");
+            assert_eq!(
+                pickers
+                    .setting_groups(cx)
+                    .iter()
+                    .find(|g| g.label == "Approvals")
+                    .unwrap()
+                    .choices
+                    .iter()
+                    .filter(|c| c.selected)
+                    .count(),
+                1
+            );
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(vec![bare_model("test-model", "Test")]),
+                cx,
+            );
+            assert!(
+                !pickers
+                    .resolved(cx)
+                    .model_options
+                    .contains_key("approvalMode")
+            );
+            assert!(
+                !pickers
+                    .setting_groups(cx)
+                    .iter()
+                    .any(|g| g.label == "Approvals")
+            );
+        });
     }
 
     #[gpui::test]
